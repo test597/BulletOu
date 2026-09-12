@@ -33,6 +33,15 @@ class GridSearchTests(unittest.TestCase):
     def plan(self, extra=()):
         return grid.make_plan(grid.parse_args([*self.argv, *extra]))
 
+    def test_summary_keeps_target_scaling_without_elapsed_seconds(self):
+        plan = self.plan(["--wrm-target-scalings", "600", "1200", "1800"])
+        fields, rows = grid.summarize(self.output, plan)
+        self.assertEqual(fields.count("wrm_target_scaling"), 1)
+        self.assertEqual({row["wrm_target_scaling"] for row in rows}, {600, 1200, 1800})
+        self.assertNotIn("elapsed_seconds", fields)
+        self.assertTrue(all("elapsed_seconds" not in row for row in rows))
+        self.assertEqual(fields[-1], "checkpoint")
+
     def summary(self, directory, rows):
         directory.mkdir(parents=True, exist_ok=True)
         fields = ["epoch", "superbatch", *grid.METRICS, "positions", "lr_start", "lr_end", "checkpoint"]

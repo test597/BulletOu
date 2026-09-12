@@ -108,7 +108,7 @@ One row represents **one condition × one reported epoch**:
 | `positions`, `lr_start`, `lr_end` | Last native row's position count and LR interval. `lr_start` need not be the epoch-start LR |
 | `lr`, `lr_min`, `wrm_target_scaling`, etc. | Settings, including individual grid-axis columns. Unspecified executable defaults are not guessed |
 | `status` | Epoch progress: `done` only when its final sb is present |
-| `trial_status`, `elapsed_seconds` | Whole-condition state and total elapsed seconds including startup; repeated across its epoch rows |
+| `trial_status` | Whole-condition state. `elapsed_seconds` is not included in the aggregate CSV |
 | `output_dir` | Condition directory |
 | `checkpoint` | **Last column**: saved checkpoint corresponding to the last row, blank if unsaved or removed |
 

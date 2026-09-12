@@ -108,7 +108,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 | `positions`, `lr_start`, `lr_end` | 本体の最後の行の局面数とLR。`lr_start` はepoch先頭とは限らず、その行の区間の先頭 |
 | `lr`, `lr_min`, `wrm_target_scaling` 等 | 指定した学習条件。grid軸は個別列になる。JSONにない既定値を推測で埋めない |
 | `status` | そのepochの進捗。末尾sbまであれば `done`。途中の値を完了結果として扱わない |
-| `trial_status`, `elapsed_seconds` | 条件全体の実行状態と、起動等も含む総経過秒数。複数epochの行で同じ値になる |
+| `trial_status` | 条件全体の実行状態。経過時間 `elapsed_seconds` は集計CSVには出力しない |
 | `output_dir` | 条件の保存先 |
 | `checkpoint` | **末尾列**。その最後の行に対応する保存checkpointのフォルダ。未保存・削除済みなら空欄 |
 
