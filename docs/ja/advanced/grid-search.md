@@ -2,6 +2,25 @@
 
 [English](../../en/advanced/grid-search.md)
 
+## WRM教師勝率の圧縮を比較する
+
+`--wrm-target-epsilon`（JSON: `wrm_target_epsilon`）は、従来のWRM変換後の教師勝率 `t` を `ε + (1 - 2ε) * t` に変換します。既定値は **0（無効）**、範囲は有限の `0 <= ε < 0.5` です。例えばε=0.01なら、0→0.01、0.5→0.5、1→0.99です。端だけをclipするのではなく、全域を0.5へ寄せます。
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260911-k3k3-b65536-sb40m.json `
+  --output-folder D:\BulletOu-snapshots\grid-target-epsilon `
+  --wrm-target-epsilons 0 0.005 0.01
+```
+
+この例は3条件を順次実行します。他のgrid軸も指定すると直積になります。`grid_summary.csv` の `wrm_target_epsilon` 列に各値を記録します。単独学習では `--wrm-target-epsilon 0.01` または設定JSONの `"wrm_target_epsilon": 0.01` を使います。
+
+- 教師側だけに適用し、予測側WRM・nn.bin形式・acc/qaccの定義は変更しません。学習と通常/GPU量子化/CPU量子化検証のlossで共通の変換です。単独の量子化検証にも同じεを指定してください。
+- 既存のresult/lambda混合より前に適用します。対局結果との混合を使う場合、最終教師値の範囲が必ず `[ε, 1-ε]` になるとは限りません。
+- `wrm_target_offset` は非線形な勝率変換を変えますが、極限は0/1のままです。εは極限自体をε/1−εにします。重みや出力を直接制限する機能ではありません。
+- ε=0は従来どおりです。`--loss-sigmoid-mse` と非ゼロεの併用はエラーです。
+- **εが異なるloss/qlossは目的関数が異なり、そのまま優劣を比較できません。** acc/qaccや棋力も確認してください。gridはこの点を警告します。
+
 `grid_search.py` は、YOSC の `trainer/grid_search.py` と同様に、指定した値の**全組み合わせを1本ずつ学習し、比較結果をCSVへ集計する**スクリプトです。Python 3.10以降の標準ライブラリだけで動きます。対象はBulletOuのcuda-cpp production学習です。
 
 TPEの `tuning_parameters.py` とは別です。勝者から次の条件へ追加学習することも、途中で条件を間引くこともありません。新規学習なら各条件が同じ決定的初期化から、追加学習なら全条件が同じ開始checkpointと教師位置から始まります。GPUの浮動小数点演算による再現誤差までなくすものではありません。

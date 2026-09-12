@@ -34,6 +34,7 @@ EXTREMA = ("max_acc", "min_loss", "max_qacc", "min_qloss")
 PLURAL_OPTIONS = {
     "lrs": "lr", "lr_mins": "lr_min",
     "wrm_target_scalings": "wrm_target_scaling",
+    "wrm_target_epsilons": "wrm_target_epsilon",
     "wrm_in_scalings": "wrm_in_scaling",
     "wrm_nnue2scores": "wrm_nnue2score",
     "batch_sizes": "batch_size", "batches_per_updates": "batches_per_update",
@@ -48,7 +49,7 @@ COMMON_COLUMNS = (
     "arch", "lr", "lr_min", "lr_schedule", "batch_size", "batches_per_update",
     "positions_per_superbatch", "superbatches", "sfnn_factorizer",
     "sfnn_factorizer_alpha", "wrm_nnue2score", "wrm_in_scaling",
-    "wrm_target_scaling", "wrm_in_offset", "wrm_target_offset", "loss_pow_exp",
+    "wrm_target_scaling", "wrm_target_epsilon", "wrm_in_offset", "wrm_target_offset", "loss_pow_exp",
 )
 MANIFEST = "grid-manifest.json"
 
@@ -173,6 +174,12 @@ def check_settings(settings: dict) -> None:
     for key in ("lr", "lr_min", "wrm_target_scaling", "wrm_in_scaling", "wrm_nnue2score"):
         if key in settings and (type(settings[key]) not in (float, int) or settings[key] <= 0):
             raise ValueError(f"{key} must be positive")
+    if "wrm_target_epsilon" in settings:
+        epsilon = settings["wrm_target_epsilon"]
+        if type(epsilon) not in (int, float) or not math.isfinite(epsilon) or not 0 <= epsilon < 0.5:
+            raise ValueError("wrm_target_epsilon must be finite and 0 <= epsilon < 0.5")
+        if epsilon and settings.get("loss_sigmoid_mse"):
+            raise ValueError("wrm_target_epsilon requires WRM loss")
     if "lr" in settings and "lr_min" in settings and settings["lr_min"] > settings["lr"]:
         raise ValueError("lr_min > lr in a grid combination; choose compatible lists (no combinations are silently skipped)")
     for key in ("validation_rate", "quantized_validation_rate"):
@@ -556,7 +563,7 @@ def main(argv=None) -> int:
             print(f"[RESUME PLAN] trial={trial['id']} parameters={trial['parameters']} max_epochs={old['settings']['max_epochs']}->{trial['settings']['max_epochs']} output={trial_dir(root, trial)}", flush=True)
     print("[CONFIG] output/output_folder/tag/resume are controlled per trial; all other common settings are preserved", flush=True)
     print(f"[CONFIG] relative teacher/input paths use cwd={plan['cwd']}", flush=True)
-    objective_keys = {"wrm_target_scaling", "wrm_target_offset", "wrm_in_scaling", "wrm_in_offset",
+    objective_keys = {"wrm_target_scaling", "wrm_target_offset", "wrm_target_epsilon", "wrm_in_scaling", "wrm_in_offset",
                       "wrm_nnue2score", "scale", "fv_scale", "loss_pow_exp", "lambda",
                       "win_rate_model", "loss_sigmoid_mse"}
     if any(key in objective_keys and len(values) > 1 for key, values in plan["axes"].items()):

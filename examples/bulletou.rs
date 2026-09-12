@@ -1292,6 +1292,11 @@ struct QuantizedTestArgs {
     #[arg(long, default_value_t = DEFAULT_WRM_TARGET_SCALING)]
     wrm_target_scaling: f32,
 
+    /// WRM teacher probability compression: epsilon + (1-2*epsilon)*t.
+    /// Must be finite and 0 <= epsilon < 0.5; 0 preserves existing behaviour.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_wrm_target_epsilon)]
+    wrm_target_epsilon: f32,
+
     /// Quantized forward path used by this subcommand. `cpu-exact` emulates
     /// YaneuraOu's integer path; `gpu` evaluates nn.bin-quantized weights
     /// with the same fast f32 GPU proxy used by live qvalid during training.
@@ -1440,6 +1445,10 @@ struct CompareSfnnQuantizationArgs {
     /// WRM target-side scaling.
     #[arg(long, default_value_t = DEFAULT_WRM_TARGET_SCALING)]
     wrm_target_scaling: f32,
+
+    /// WRM teacher probability compression: epsilon + (1-2*epsilon)*t.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_wrm_target_epsilon)]
+    wrm_target_epsilon: f32,
 
     /// Factorizer interpretation used while loading the fp32 state.
     #[arg(long = "sfnn-factorizer", default_value = "shared")]
@@ -1782,6 +1791,7 @@ impl QuantizedTestArgs {
         if !(self.wrm_target_scaling.is_finite() && self.wrm_target_scaling > 0.0) {
             return Err(format!("--wrm-target-scaling must be finite and > 0 (got {})", self.wrm_target_scaling));
         }
+        validate_wrm_target_epsilon(self.wrm_target_epsilon, !self.loss_sigmoid_mse)?;
         if !self.engine_score_offset.is_finite() {
             return Err(format!("--engine-score-offset must be finite (got {})", self.engine_score_offset));
         }
@@ -1861,6 +1871,7 @@ impl CompareSfnnQuantizationArgs {
     }
 
     fn training_args(&self) -> Result<Args, String> {
+        validate_wrm_target_epsilon(self.wrm_target_epsilon, !self.loss_sigmoid_mse)?;
         let raw = vec![
             "bulletou".to_string(),
             "--backend".to_string(),
@@ -1887,6 +1898,8 @@ impl CompareSfnnQuantizationArgs {
             self.wrm_target_offset.to_string(),
             "--wrm-target-scaling".to_string(),
             self.wrm_target_scaling.to_string(),
+            "--wrm-target-epsilon".to_string(),
+            self.wrm_target_epsilon.to_string(),
             "--loss-pow-exp".to_string(),
             self.loss_pow_exp.to_string(),
         ];
@@ -1924,6 +1937,7 @@ impl CompareSfnnQuantizationArgs {
             wrm_target_offset: self.wrm_target_offset,
             wrm_target_scaling: self.wrm_target_scaling,
             mode: self.mode,
+            wrm_target_epsilon: self.wrm_target_epsilon,
             cuda_cpp_device: self.cuda_cpp_device,
             quant_ft_round: self.quant_ft_round,
             quant_crelu_round: self.quant_crelu_round,
@@ -2093,6 +2107,7 @@ impl AverageSfnnStateArgs {
             wrm_in_scaling: DEFAULT_WRM_IN_SCALING,
             wrm_target_offset: DEFAULT_WRM_TARGET_OFFSET,
             wrm_target_scaling: DEFAULT_WRM_TARGET_SCALING,
+            wrm_target_epsilon: 0.0,
             mode: QuantizedTestMode::CpuExact,
             cuda_cpp_device: 0,
             quant_ft_round: QuantizedRoundMode::Floor,
@@ -2239,6 +2254,10 @@ struct QuantizedCalibrateArgs {
     #[arg(long, default_value_t = DEFAULT_WRM_TARGET_SCALING)]
     wrm_target_scaling: f32,
 
+    /// WRM teacher probability compression: epsilon + (1-2*epsilon)*t.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_wrm_target_epsilon)]
+    wrm_target_epsilon: f32,
+
     /// Search objective used to choose the folded offset.
     #[arg(long, value_enum, default_value = "loss")]
     objective: QuantizedCalibrateObjective,
@@ -2309,6 +2328,7 @@ impl QuantizedCalibrateArgs {
             wrm_target_offset: self.wrm_target_offset,
             wrm_target_scaling: self.wrm_target_scaling,
             mode: QuantizedTestMode::CpuExact,
+            wrm_target_epsilon: self.wrm_target_epsilon,
             cuda_cpp_device: 0,
             quant_ft_round: self.quant_ft_round,
             quant_crelu_round: self.quant_crelu_round,
@@ -4715,6 +4735,12 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_WRM_TARGET_SCALING)]
     wrm_target_scaling: f32,
 
+    /// WRM teacher probability compression: epsilon + (1-2*epsilon)*t,
+    /// before result blending. Predictions and accuracy are unchanged.
+    /// Must be finite and 0 <= epsilon < 0.5; 0 disables compression.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_wrm_target_epsilon)]
+    wrm_target_epsilon: f32,
+
     /// Optimizer weight decay for the selected optimizer. Default follows
     /// the tatara SFNN-1536 reference recipe.
     #[arg(long, default_value = "0.0")]
@@ -5361,6 +5387,7 @@ impl Args {
         if !(self.wrm_target_scaling.is_finite() && self.wrm_target_scaling > 0.0) {
             return Err(format!("--wrm-target-scaling must be finite and > 0 (got {})", self.wrm_target_scaling));
         }
+        validate_wrm_target_epsilon(self.wrm_target_epsilon, effective_win_rate_model(self))?;
         if let Some(scale) = self.scale {
             if !(scale.is_finite() && scale > 0.0) {
                 return Err(format!("--scale must be finite and > 0 (got {scale})"));
@@ -5623,8 +5650,24 @@ fn effective_wrm_in_scaling(args: &Args) -> f32 {
     args.wrm_in_scaling
 }
 
+fn validate_wrm_target_epsilon(epsilon: f32, wrm: bool) -> Result<(), String> {
+    if !epsilon.is_finite() || !(0.0..0.5).contains(&epsilon) {
+        return Err("--wrm-target-epsilon must be finite and 0 <= epsilon < 0.5".to_string());
+    }
+    if epsilon != 0.0 && !wrm {
+        return Err("--wrm-target-epsilon requires WRM loss; remove --loss-sigmoid-mse".to_string());
+    }
+    Ok(())
+}
+
+fn parse_wrm_target_epsilon(raw: &str) -> Result<f32, String> {
+    let epsilon: f32 = raw.parse().map_err(|_| "--wrm-target-epsilon requires a number".to_string())?;
+    validate_wrm_target_epsilon(epsilon, true)?;
+    Ok(epsilon)
+}
+
 fn effective_wrm_target_params(args: &Args) -> bulletou_lib::value::WinRateModelTargetParams {
-    bulletou_lib::value::WinRateModelTargetParams { offset: args.wrm_target_offset, scaling: args.wrm_target_scaling }
+    bulletou_lib::value::WinRateModelTargetParams { offset: args.wrm_target_offset, scaling: args.wrm_target_scaling, epsilon: args.wrm_target_epsilon }
 }
 
 fn effective_scale(args: &Args) -> f32 {
@@ -5704,7 +5747,7 @@ fn resolve_wrm_loss_params(args: &Args) -> Result<(), String> {
             effective_wrm_in_scaling(args)
         ),
     );
-    print_startup_kv("WRM target", format!("offset={:.3}, scaling={:.3}", target.offset, target.scaling));
+    print_startup_kv("WRM target", format!("offset={:.3}, scaling={:.3}, epsilon={:.6}", target.offset, target.scaling, target.epsilon));
     Ok(())
 }
 
@@ -6677,7 +6720,7 @@ fn quantized_effective_win_rate_model(args: &QuantizedTestArgs) -> bool {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_wrm_target_params(args: &QuantizedTestArgs) -> bulletou_lib::value::WinRateModelTargetParams {
-    bulletou_lib::value::WinRateModelTargetParams { offset: args.wrm_target_offset, scaling: args.wrm_target_scaling }
+    bulletou_lib::value::WinRateModelTargetParams { offset: args.wrm_target_offset, scaling: args.wrm_target_scaling, epsilon: args.wrm_target_epsilon }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -8492,6 +8535,7 @@ fn quantized_test_args_from_training_args(args: &Args, nn_bin: PathBuf) -> Resul
         wrm_in_scaling: effective_wrm_in_scaling(args),
         wrm_target_offset: effective_wrm_target_params(args).offset,
         wrm_target_scaling: effective_wrm_target_params(args).scaling,
+        wrm_target_epsilon: effective_wrm_target_params(args).epsilon,
         mode: if args.quantized_validation_exact { QuantizedTestMode::CpuExact } else { QuantizedTestMode::Gpu },
         cuda_cpp_device: args.cuda_cpp_device,
         quant_ft_round: QuantizedRoundMode::Floor,
@@ -24816,6 +24860,7 @@ fn resume_signature(args: &Args) -> String {
         format!("wrm_in_scaling={:.9}", effective_wrm_in_scaling(args)),
         format!("wrm_target_offset={:.9}", effective_wrm_target_params(args).offset),
         format!("wrm_target_scaling={:.9}", effective_wrm_target_params(args).scaling),
+        format!("wrm_target_epsilon={:.9}", effective_wrm_target_params(args).epsilon),
         format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
         format!("optimizer_weight_clip={}", optimizer_weight_clip_signature(args)),
         format!(
@@ -25009,6 +25054,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "wrm_in_scaling=", "wrm_in_offset=", "wrm_in_scaling=340.000000000");
     ensure_line_after(&mut out, "wrm_target_offset=", "wrm_in_scaling=", "wrm_target_offset=270.000000000");
     ensure_line_after(&mut out, "wrm_target_scaling=", "wrm_target_offset=", "wrm_target_scaling=380.000000000");
+    ensure_line_after(&mut out, "wrm_target_epsilon=", "wrm_target_scaling=", "wrm_target_epsilon=0.000000000");
     ensure_line_after(&mut out, "no_ft_factorize=", "nnue_pytorch_init_scale=", "no_ft_factorize=false");
     ensure_line_after(&mut out, "ft_factorizer_alpha=", "no_ft_factorize=", "ft_factorizer_alpha=1.000000000");
     ensure_line_after(&mut out, "sfnn_init_bias=", "ft_factorizer_alpha=", "sfnn_init_bias=zero");
@@ -26843,6 +26889,38 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::str::FromStr;
+
+    #[test]
+    fn wrm_target_epsilon_cli_validation() {
+        assert_eq!(parse_wrm_target_epsilon("0.01").unwrap(), 0.01);
+        for raw in ["-0.1", "0.5", "nan", "inf", "no"] {
+            assert!(parse_wrm_target_epsilon(raw).is_err());
+        }
+        assert!(validate_wrm_target_epsilon(0.0, false).is_ok());
+        assert!(validate_wrm_target_epsilon(0.01, false).is_err());
+        let args = Args::try_parse_from([
+            "bulletou", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--teacher", "unused",
+            "--wrm-target-epsilon", "0.01",
+        ]).unwrap();
+        assert_eq!(effective_wrm_target_params(&args).epsilon, 0.01);
+        let base = ["bulletou", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--teacher", "unused"];
+        let off = Args::try_parse_from(base).unwrap();
+        let legacy = resume_signature_without_line(&resume_signature(&off), "wrm_target_epsilon=");
+        assert!(resume_signature_matches(&legacy, &off));
+        assert!(resume_signature(&args).contains("wrm_target_epsilon=0.010"));
+        let mut argv: Vec<OsString> = base.map(Into::into).to_vec();
+        bulletou_settings_json_value_to_args(
+            Path::new("settings.json"), "wrm_target_epsilon", &serde_json::json!(0.01), &mut argv,
+        ).unwrap();
+        assert_eq!(Args::try_parse_from(argv).unwrap().wrm_target_epsilon, 0.01);
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let mut args = args;
+            args.test_teacher = Some(PathBuf::from("unused.hcpe"));
+            let q = quantized_test_args_from_training_args(&args, PathBuf::from("unused.bin")).unwrap().unwrap();
+            assert_eq!(quantized_wrm_target_params(&q).epsilon, 0.01);
+        }
+    }
 
     #[test]
     fn kppt_black_perspective_component_flips_white_to_move() {

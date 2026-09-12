@@ -647,19 +647,29 @@ pub const DEFAULT_WRM_TARGET_SCALING: f32 = 380.0;
 pub struct WinRateModelTargetParams {
     pub offset: f32,
     pub scaling: f32,
+    /// Compress the teacher probability towards 0.5 (not the prediction).
+    pub epsilon: f32,
 }
 
 impl WinRateModelTargetParams {
-    pub const DEFAULT: Self = Self { offset: DEFAULT_WRM_TARGET_OFFSET, scaling: DEFAULT_WRM_TARGET_SCALING };
+    pub const DEFAULT: Self = Self { offset: DEFAULT_WRM_TARGET_OFFSET, scaling: DEFAULT_WRM_TARGET_SCALING, epsilon: 0.0 };
 
     pub fn new(offset: f32, scaling: f32) -> Option<Self> {
-        (offset.is_finite() && scaling.is_finite() && scaling > 0.0).then_some(Self { offset, scaling })
+        Self::with_epsilon(offset, scaling, 0.0)
+    }
+
+    pub fn with_epsilon(offset: f32, scaling: f32, epsilon: f32) -> Option<Self> {
+        (offset.is_finite() && scaling.is_finite() && scaling > 0.0
+            && epsilon.is_finite() && (0.0..0.5).contains(&epsilon))
+            .then_some(Self { offset, scaling, epsilon })
     }
 
     pub fn probability(self, score: f32) -> f32 {
         let p = (score - self.offset) / self.scaling;
         let pm = (-score - self.offset) / self.scaling;
-        0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
+        let probability = 0.5 * (1.0 + sigmoid(p) - sigmoid(pm));
+        // Keep the epsilon=0 path bit-for-bit unchanged.
+        if self.epsilon == 0.0 { probability } else { self.epsilon + (1.0 - 2.0 * self.epsilon) * probability }
     }
 }
 
@@ -920,6 +930,31 @@ fn splitmix64(mut x: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wrm_target_epsilon_compresses_and_separates_cache() {
+        use super::{win_rate_model_score_table, WinRateModelTargetParams};
+        let old = WinRateModelTargetParams::new(270.0, 380.0).unwrap();
+        let compressed = WinRateModelTargetParams::with_epsilon(270.0, 380.0, 0.01).unwrap();
+        let a = win_rate_model_score_table(old);
+        let b = win_rate_model_score_table(compressed);
+        assert!(!std::sync::Arc::ptr_eq(&a, &b));
+        assert!(std::sync::Arc::ptr_eq(&b, &win_rate_model_score_table(compressed)));
+        for score in i16::MIN..=i16::MAX {
+            let s = f32::from(score);
+            let original = 0.5 * (1.0 + super::sigmoid((s - old.offset) / old.scaling)
+                - super::sigmoid((-s - old.offset) / old.scaling));
+            assert_eq!(old.probability(s).to_bits(), original.to_bits());
+            let index = (i32::from(score) - i32::from(i16::MIN)) as usize;
+            assert!((b[index] - (0.01 + 0.98 * a[index])).abs() < 1e-7);
+        }
+        assert_eq!(compressed.probability(0.0), 0.5);
+        assert!((compressed.probability(-32768.0) - 0.01).abs() < 1e-7);
+        assert!((compressed.probability(32767.0) - 0.99).abs() < 1e-7);
+        for epsilon in [-0.01, 0.5, 1.0, f32::NAN, f32::INFINITY] {
+            assert!(WinRateModelTargetParams::with_epsilon(0.0, 600.0, epsilon).is_none());
+        }
+    }
+
     use crate::{
         game::{inputs::SparseInputType, outputs::OutputBuckets},
         value::loader::{DataLoader, GameResult, LoadableDataType, PreparedData},

@@ -1631,10 +1631,10 @@ fn validate_sfnn_config(config: &SfnnTeacherBatchConfig<'_>) -> Result<(), Teach
 }
 
 fn validate_wrm_target(enabled: bool, params: WinRateModelTargetParams) -> Result<(), TeacherBatchError> {
-    if enabled && WinRateModelTargetParams::new(params.offset, params.scaling).is_none() {
+    if enabled && WinRateModelTargetParams::with_epsilon(params.offset, params.scaling, params.epsilon).is_none() {
         return Err(TeacherBatchError::invalid_input(format!(
-            "WRM target parameters must be finite and scaling > 0 (offset={}, scaling={})",
-            params.offset, params.scaling
+            "WRM target parameters must be finite, scaling > 0, 0 <= epsilon < 0.5 (offset={}, scaling={}, epsilon={})",
+            params.offset, params.scaling, params.epsilon
         )));
     }
     Ok(())

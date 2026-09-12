@@ -4,6 +4,8 @@
 
 [チュートリアル 3: 学習を走らせる](../tutorial/3-train.md) のコマンドが動いたあとに読むページです。
 
+WRM教師勝率を0/1から内側へ圧縮する `--wrm-target-epsilon`（既定値0、JSON: `wrm_target_epsilon`）の計算式は `t' = ε + (1 - 2ε)t` です。[grid searchの説明](grid-search.md#wrm教師勝率の圧縮を比較する)に範囲・offsetとの違い・複数値の実行例を記載しています。
+
 最初の学習では、まずデフォルト値のままで十分です。速度、保存頻度、検証頻度、学習率、loss、SFNN factorizer などを調整したくなったら、このページを見てください。
 
 チュートリアルでは `bulletou-settings.json` を使います。このページに出てくる CLI flag は、先頭の `--` を外し、ハイフンをアンダースコアにすると、そのまま JSON に書けます。

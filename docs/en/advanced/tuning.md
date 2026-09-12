@@ -4,6 +4,8 @@
 
 Read this page after the command in [Tutorial 3: Run training](../tutorial/3-train.md) works.
 
+`--wrm-target-epsilon` (default 0; JSON: `wrm_target_epsilon`) compresses WRM teacher probabilities away from 0/1 using `t' = epsilon + (1 - 2*epsilon)t`. See [grid search](grid-search.md#compare-wrm-teacher-probability-compression) for its range, differences from target offset, and comparison commands.
+
 For a first run, keep the defaults. Come back here when you want to adjust speed, save frequency, validation frequency, learning rate, loss, or SFNN factorizer settings.
 
 The tutorial uses `bulletou-settings.json`. Every CLI flag on this page can be written in that file by removing the leading `--` and replacing hyphens with underscores:

@@ -2,6 +2,25 @@
 
 [日本語](../../ja/advanced/grid-search.md)
 
+## Compare WRM teacher-probability compression
+
+`--wrm-target-epsilon` (JSON: `wrm_target_epsilon`) transforms the existing WRM teacher probability `t` into `epsilon + (1 - 2*epsilon) * t`. Default **0 preserves the original calculation**; valid values are finite `0 <= epsilon < 0.5`. For epsilon=0.01, 0 maps to 0.01, 0.5 stays 0.5, and 1 maps to 0.99. This compresses the entire range towards 0.5 rather than clipping only the tails.
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260911-k3k3-b65536-sb40m.json `
+  --output-folder D:\BulletOu-snapshots\grid-target-epsilon `
+  --wrm-target-epsilons 0 0.005 0.01
+```
+
+This runs three conditions sequentially. Additional grid axes form a Cartesian product. `grid_summary.csv` includes `wrm_target_epsilon`. For standalone training, use `--wrm-target-epsilon 0.01` or `"wrm_target_epsilon": 0.01` in the settings JSON.
+
+- Applied only to the teacher, before existing result/lambda blending; blending may therefore produce final targets outside `[epsilon, 1-epsilon]`. Prediction WRM, nn.bin format and accuracy definitions are unchanged.
+- Training, regular validation, GPU quantized validation and exact CPU quantized validation share the target transform. Pass the same epsilon to standalone quantized validation.
+- Unlike `wrm_target_offset`, whose limiting probabilities remain 0 and 1, epsilon changes those limits. It does not directly constrain network weights or outputs.
+- Nonzero epsilon with `--loss-sigmoid-mse` is rejected.
+- **Loss/qloss across different epsilon values are different objectives and cannot be ranked directly as a common loss.** Grid search warns about this; also compare accuracy and playing strength.
+
 `grid_search.py` follows the workflow of YOSC's `trainer/grid_search.py`: enumerate the Cartesian product of explicit values, train each condition sequentially, and aggregate CSV results. It uses only the Python 3.10+ standard library and supports BulletOu's cuda-cpp production schedule.
 
 This is separate from the TPE-based `tuning_parameters.py`. Trials are independent, never warm-started from another trial's winner or pruned. Fresh runs use the normal deterministic scratch initialization; checkpoint runs share the same initial state and dataloader position. GPU numerical reproducibility is not guaranteed.

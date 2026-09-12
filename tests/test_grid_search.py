@@ -42,6 +42,17 @@ class GridSearchTests(unittest.TestCase):
         self.assertTrue(all("elapsed_seconds" not in row for row in rows))
         self.assertEqual(fields[-1], "checkpoint")
 
+    def test_target_epsilon_grid_and_summary(self):
+        plan = self.plan(["--wrm-target-epsilons", "0", "0.005", "0.01"])
+        fields, rows = grid.summarize(self.output, plan)
+        self.assertEqual(fields.count("wrm_target_epsilon"), 1)
+        self.assertEqual({row["wrm_target_epsilon"] for row in rows}, {0, 0.005, 0.01})
+        for value in [-0.01, 0.5, float("nan"), float("inf"), True, "0.01"]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                grid.check_settings({**self.common, "wrm_target_epsilon": value})
+        with self.assertRaises(ValueError):
+            grid.check_settings({**self.common, "wrm_target_epsilon": 0.01, "loss_sigmoid_mse": True})
+
     def summary(self, directory, rows):
         directory.mkdir(parents=True, exist_ok=True)
         fields = ["epoch", "superbatch", *grid.METRICS, "positions", "lr_start", "lr_end", "checkpoint"]
