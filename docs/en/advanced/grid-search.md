@@ -151,6 +151,8 @@ Ordinary reruns reject a changed plan. With `--resume`, you may select a subset 
 
 ### Extend completed conditions
 
+Normal runs and `--resume` follow **the current command-line condition order** for execution and CSV display, like normal YOSC runs. Values are not numerically sorted; existing and new conditions share the same ordering. Unselected existing conditions follow at the end in their previous relative order. IDs and output paths remain unchanged, so trial IDs need not be ascending in the CSV. `--summary-only` retains the last order stored in the manifest.
+
 For an existing 600/1200/1800 grid planned for five epochs each, extend only 600/1200 by five epochs, **to ten epochs total**, using the same output root:
 
 ```powershell

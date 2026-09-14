@@ -491,7 +491,8 @@ class GridSearchTests(unittest.TestCase):
         req = grid.make_plan(grid.parse_args([*argv[:-3], "1200", "--epochs", "7", "--resume"]))
         merged, selected = grid.plan_resume(self.output, old, req)
         self.assertEqual(selected, {2})
-        self.assertEqual(merged["trials"][1]["name"], old["trials"][1]["name"])
+        self.assertEqual(merged["trials"][0]["name"], old["trials"][1]["name"])
+        self.assertEqual([t["id"] for t in merged["trials"]], [2, 1, 3])
         rows = grid.summarize(self.output, merged)[1]
         self.assertTrue(all(r["status"] == "incomplete" and not r.get("test_value_accuracy") for r in rows if r["trial"] == 2))
         self.assertEqual({r["trial_status"] for r in rows if r["trial"] == 1}, {"done"})
@@ -525,7 +526,10 @@ class GridSearchTests(unittest.TestCase):
             self.assertEqual(grid.main(requested), 0)
         self.assertEqual(seen, [4, 5])
         merged = grid.read_json(self.output / grid.MANIFEST)
-        self.assertEqual(merged["trials"][:3], old["trials"])
+        self.assertEqual([t for t in merged["trials"] if t["id"] <= 3], old["trials"])
+        self.assertEqual([t["id"] for t in merged["trials"]], [4, 1, 5, 2, 3])
+        self.assertEqual([r["trial"] for r in grid.summarize(self.output, merged)[1]],
+                         [4, 4, 1, 1, 5, 5, 2, 2, 3, 3])
         self.assertEqual(merged["axes"]["wrm_target_scaling"], [600, 1200, 1800, 2400, 3000])
         self.assertEqual(before, {p: p.read_bytes() for p in before})
         self.assertEqual({r["trial"] for r in grid.summarize(self.output, merged)[1]}, {1,2,3,4,5})

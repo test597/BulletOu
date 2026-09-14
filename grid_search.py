@@ -432,6 +432,10 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
             trial["settings"]["max_epochs"] = new
         selected.add(trial["id"])
     merged["report_epochs"] = sorted(report_epochs)
+    # IDs identify persistent outputs; list order follows this invocation's CLI.
+    ordered = [next(t for t in merged["trials"] if t["parameters"] == c["parameters"])
+               for c in requested["trials"]]
+    merged["trials"] = ordered + [t for t in merged["trials"] if t["id"] not in selected]
     return merged, selected
 
 
