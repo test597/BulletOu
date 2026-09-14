@@ -114,9 +114,9 @@ grid-target-scale/
 
 短いhashは条件全体から作ります。フォルダ名では省略された条件も `bulletou-settings.json` とmanifestに残ります。再開時だけ、開始state指定を外した `bulletou-resume-settings.json` も作ります。
 
-`grid_summary.csv` は、完了済みtrialがなければ学習開始前にヘッダだけを作り、条件開始・終了・中断時に再集計します。**指定された最終epoch・最終sbまで完了したtrialだけ**を掲載します。途中停止・失敗・実行中のtrialは、完了済みepochが含まれていても空行を含めて掲載しません。完了trialでも末尾sbが記録されていないepochは掲載しません。各条件の途中経過は本体の `summary-learn.csv` と、接頭辞付きで流れるstdoutを確認してください。stdoutは条件ごとの `stdout.log` にも追記保存します。集計のために元ログを削除・変更することはありません。
+`grid_summary.csv` は、YOSCと同様に学習開始前から全条件の行を作ります。各行には実験条件・対象epoch・保存先・状態を記録し、条件開始・終了・中断時に再集計します。未開始は `pending`、実行中は `running`、中断は `interrupted`、失敗は `failed` です。**測定結果は指定された最終epoch・最終sbまで完了したtrialだけ**に記入します。未完了trialのacc/loss/qacc/qloss・最大最小値・実測sb・checkpointは空欄のままです。完了trialでも末尾sbが記録されていないepochは掲載しません。途中経過は本体の `summary-learn.csv` や条件ごとの `stdout.log` で確認してください。元ログは変更しません。
 
-延長したtrialは、新しい学習量を完了するまで集計対象から外れます。最終行と保存checkpointが揃っていれば、runnerの完了状態記録前の中断も完了として回復します（失敗状態を除く）。既存CSVも `--summary-only` または次回起動で、この規則に従って再集計されます。
+延長したtrialは、新しい学習量を完了するまで条件行だけを掲載し、測定結果は空欄にします。最終行と保存checkpointが揃っていれば、runnerの完了状態記録前の中断も完了として回復します（失敗状態を除く）。既存CSVも `--summary-only` または次回起動で、この規則に従って再集計されます。
 
 CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです。
 

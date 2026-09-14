@@ -452,6 +452,15 @@ def summarize(root: Path, plan: dict, epochs=None) -> tuple[list[str], list[dict
         # Publish only completed conditions, never partial epoch/trial results.
         # Reuse resume's completion check, including saved-final-row recovery.
         if not is_complete(directory, trial, state):
+            status = state.get("status", "pending")
+            if status == "done":
+                status = "incomplete"
+            for epoch in epochs or plan["report_epochs"]:
+                if epoch <= trial["settings"]["max_epochs"]:
+                    row = {key: trial["settings"].get(key, "") for key in parameter_columns}
+                    row.update(trial=trial["id"], epoch=epoch, status=status,
+                               trial_status=status, output_dir=str(directory))
+                    result.append(row)
             continue
         rows = log_rows(directory)
         trial_status = "done"

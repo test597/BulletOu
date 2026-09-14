@@ -114,9 +114,9 @@ grid-target-scale/
 
 The short hash covers the complete condition; full settings are kept in the per-trial JSON and manifest. Resuming also writes `bulletou-resume-settings.json`, omitting the common initial-state arguments so BulletOu resumes the trial itself.
 
-The aggregate CSV initially contains only the header when no trials have completed. It is rebuilt at trial start/end/interruption and includes **only trials that reached their configured final epoch and final sb**. Running, interrupted, or failed trials have no result or placeholder rows, even if some of their epochs finished. Epochs missing their final sb are also omitted. During a trial, inspect its ordinary `summary-learn.csv` and live prefixed stdout; the child output is also appended to `stdout.log`. Aggregation never modifies source logs.
+Like YOSC, the aggregate CSV includes condition rows before training starts, with settings, target epoch, output directory and status. It is rebuilt at trial start/end/interruption. States include `pending`, `running`, `interrupted` and `failed`. **Measured results are populated only for trials that reached their configured final epoch and final sb**. Unfinished trials retain their condition rows, but metrics, extrema, measured sb and checkpoint stay blank. Completed trials' epochs missing their final sb are omitted. Inspect `summary-learn.csv` or `stdout.log` for intermediate measurements. Aggregation never modifies source logs.
 
-An extended trial is excluded until its new budget completes. A final log row with a saved checkpoint can recover completion after interruption before the runner records completion (except a failed state). Existing aggregate CSVs adopt these rules on the next run or with `--summary-only`.
+An extended trial retains condition rows with blank measurements until its new budget completes. A final log row with a saved checkpoint can recover completion after interruption before the runner records completion (except a failed state). Existing aggregate CSVs adopt these rules on the next run or with `--summary-only`.
 
 One row represents **one condition × one reported epoch**:
 

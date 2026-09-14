@@ -216,7 +216,7 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(row["max_qacc_sb"], "2")
         self.assertEqual(row["checkpoint"], str(directory / "0001"))
         self.assertEqual(result[1]["status"], "done")
-        self.assertEqual(len(result), 2)
+        self.assertEqual(len(result), 4)
         self.assertEqual(rows[-1]["quantized_value_accuracy"], "-")
 
     def test_unsaved_peak_no_invented_checkpoint(self):
@@ -238,7 +238,7 @@ class GridSearchTests(unittest.TestCase):
         result = grid.summarize(self.output, plan)[1]
         self.assertEqual(result[0]["min_qloss"], "0")
         self.assertEqual(result[0]["test_value_accuracy"], "0")
-        self.assertEqual(len(result), 2)
+        self.assertEqual(len(result), 4)
 
     def test_duplicate_points_use_latest_row_not_file_time(self):
         directory = self.root / "trial"
@@ -255,11 +255,16 @@ class GridSearchTests(unittest.TestCase):
             with self.subTest(status=status):
                 grid.atomic_json(directory / "grid-state.json", {"status": status})
                 path = self.output / "grid_summary.csv"
-                self.assertEqual(grid.write_summary(self.output, plan, path), [])
+                result = grid.write_summary(self.output, plan, path)
+                self.assertEqual(len(result), 4)
+                self.assertEqual(result[0]["lr"], 0.0001)
+                self.assertEqual(result[0]["status"], "incomplete" if status == "done" else status)
                 with path.open(encoding="utf-8-sig", newline="") as f:
                     reader = csv.DictReader(f)
                     self.assertIn("test_value_accuracy", reader.fieldnames)
-                    self.assertEqual(list(reader), [])
+                    for row in reader:
+                        for key in (*grid.METRICS, *grid.EXTREMA, "checkpoint", "superbatch", "positions"):
+                            self.assertEqual(row[key], "")
         self.assertEqual((directory / grid.SUMMARY_CSV_NAME).read_bytes(), source)
 
     def test_summary_recovers_saved_final_but_excludes_failed_trial(self):
@@ -269,10 +274,10 @@ class GridSearchTests(unittest.TestCase):
         self.summary(directory, [self.metrics(epoch=1, sb=2), self.metrics(epoch=2, checkpoint="0001")])
         grid.atomic_json(directory / "grid-state.json", {"status": "interrupted"})
         rows = grid.summarize(self.output, plan)[1]
-        self.assertEqual([r["epoch"] for r in rows], [2])
+        self.assertEqual([r["epoch"] for r in rows if r["status"] == "done"], [2])
         self.assertEqual(rows[0]["trial_status"], "done")
         grid.atomic_json(directory / "grid-state.json", {"status": "failed"})
-        self.assertEqual(grid.summarize(self.output, plan)[1], [])
+        self.assertTrue(all(not r.get("test_value_accuracy") for r in grid.summarize(self.output, plan)[1]))
 
     def test_truncated_row_rejected_without_touching_source(self):
         directory = self.root / "trial"
@@ -488,7 +493,7 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(selected, {2})
         self.assertEqual(merged["trials"][1]["name"], old["trials"][1]["name"])
         rows = grid.summarize(self.output, merged)[1]
-        self.assertFalse(any(r["trial"] == 2 for r in rows))
+        self.assertTrue(all(r["status"] == "incomplete" and not r.get("test_value_accuracy") for r in rows if r["trial"] == 2))
         self.assertEqual({r["trial_status"] for r in rows if r["trial"] == 1}, {"done"})
 
     def test_extension_with_missing_checkpoint_restarts_only_that_condition(self):
