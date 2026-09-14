@@ -114,7 +114,9 @@ grid-target-scale/
 
 短いhashは条件全体から作ります。フォルダ名では省略された条件も `bulletou-settings.json` とmanifestに残ります。再開時だけ、開始state指定を外した `bulletou-resume-settings.json` も作ります。
 
-`grid_summary.csv` は学習開始前からヘッダと空の結果行を作り、条件開始・終了・中断時に更新します。各条件の学習中は本体の `summary-learn.csv` と、接頭辞付きで流れるstdoutを確認してください。stdoutは条件ごとの `stdout.log` にも追記保存します。
+`grid_summary.csv` は、完了済みtrialがなければ学習開始前にヘッダだけを作り、条件開始・終了・中断時に再集計します。**指定された最終epoch・最終sbまで完了したtrialだけ**を掲載します。途中停止・失敗・実行中のtrialは、完了済みepochが含まれていても空行を含めて掲載しません。完了trialでも末尾sbが記録されていないepochは掲載しません。各条件の途中経過は本体の `summary-learn.csv` と、接頭辞付きで流れるstdoutを確認してください。stdoutは条件ごとの `stdout.log` にも追記保存します。集計のために元ログを削除・変更することはありません。
+
+延長したtrialは、新しい学習量を完了するまで集計対象から外れます。最終行と保存checkpointが揃っていれば、runnerの完了状態記録前の中断も完了として回復します（失敗状態を除く）。既存CSVも `--summary-only` または次回起動で、この規則に従って再集計されます。
 
 CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです。
 
@@ -126,7 +128,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 | `max_acc_sb`, `min_loss_sb`, `max_qacc_sb`, `min_qloss_sb` | 各最大／最小のsb。同値なら最初のsb |
 | `positions`, `lr_start`, `lr_end` | 本体の最後の行の局面数とLR。`lr_start` はepoch先頭とは限らず、その行の区間の先頭 |
 | `lr`, `lr_min`, `wrm_target_scaling` 等 | 指定した学習条件。grid軸は個別列になる。JSONにない既定値を推測で埋めない |
-| `status` | そのepochの進捗。末尾sbまであれば `done`。途中の値を完了結果として扱わない |
+| `status` | 掲載対象は末尾sbまで記録されたepochのみで、`done` |
 | `trial_status` | 条件全体の実行状態。経過時間 `elapsed_seconds` は集計CSVには出力しない |
 | `output_dir` | 条件の保存先 |
 | `checkpoint` | **末尾列**。その最後の行に対応する保存checkpointのフォルダ。未保存・削除済みなら空欄 |

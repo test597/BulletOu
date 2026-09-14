@@ -114,7 +114,9 @@ grid-target-scale/
 
 The short hash covers the complete condition; full settings are kept in the per-trial JSON and manifest. Resuming also writes `bulletou-resume-settings.json`, omitting the common initial-state arguments so BulletOu resumes the trial itself.
 
-The aggregate CSV exists before the first training run, initially containing the header and empty result rows. It is updated at trial start/end/interruption. During a trial, inspect its ordinary `summary-learn.csv` and live prefixed stdout; the child output is also appended to `stdout.log`.
+The aggregate CSV initially contains only the header when no trials have completed. It is rebuilt at trial start/end/interruption and includes **only trials that reached their configured final epoch and final sb**. Running, interrupted, or failed trials have no result or placeholder rows, even if some of their epochs finished. Epochs missing their final sb are also omitted. During a trial, inspect its ordinary `summary-learn.csv` and live prefixed stdout; the child output is also appended to `stdout.log`. Aggregation never modifies source logs.
+
+An extended trial is excluded until its new budget completes. A final log row with a saved checkpoint can recover completion after interruption before the runner records completion (except a failed state). Existing aggregate CSVs adopt these rules on the next run or with `--summary-only`.
 
 One row represents **one condition × one reported epoch**:
 
@@ -126,7 +128,7 @@ One row represents **one condition × one reported epoch**:
 | Corresponding `*_sb` columns | Location of each extremum; first sb on ties |
 | `positions`, `lr_start`, `lr_end` | Last native row's position count and LR interval. `lr_start` need not be the epoch-start LR |
 | `lr`, `lr_min`, `wrm_target_scaling`, etc. | Settings, including individual grid-axis columns. Unspecified executable defaults are not guessed |
-| `status` | Epoch progress: `done` only when its final sb is present |
+| `status` | Always `done`; only epochs with their final sb are included |
 | `trial_status` | Whole-condition state. `elapsed_seconds` is not included in the aggregate CSV |
 | `output_dir` | Condition directory |
 | `checkpoint` | **Last column**: saved checkpoint corresponding to the last row, blank if unsaved or removed |

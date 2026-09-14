@@ -431,20 +431,21 @@ def summarize(root: Path, plan: dict, epochs=None) -> tuple[list[str], list[dict
         directory = trial_dir(root, trial)
         state_path = directory / "grid-state.json"
         state = read_json(state_path) if state_path.is_file() else {}
+        # Publish only completed conditions, never partial epoch/trial results.
+        # Reuse resume's completion check, including saved-final-row recovery.
+        if not is_complete(directory, trial, state):
+            continue
         rows = log_rows(directory)
-        trial_status = state.get("status", "pending")
-        target = (trial["settings"]["max_epochs"], trial["settings"]["superbatches"])
-        if trial_status == "done" and not any((int(r["epoch"]), int(r["superbatch"])) == target for r in rows):
-            trial_status = "incomplete"  # Completed the old budget, not the extended one.
+        trial_status = "done"
         for epoch in epochs or plan["report_epochs"]:
             if epoch > trial["settings"]["max_epochs"]:
                 continue  # Unselected conditions were not extended.
             group = [row for row in rows if int(row["epoch"]) == epoch]
             last = group[-1] if group else {}
             closed = last and int(last["superbatch"]) == trial["settings"]["superbatches"]
-            status = "done" if closed else (state.get("status", "pending") if group else "pending")
-            if not closed and status == "done":
-                status = "incomplete"
+            if not closed:
+                continue
+            status = "done"
             row = {key: trial["settings"].get(key, "") for key in parameter_columns}
             row.update(trial=trial["id"], epoch=epoch, superbatch=last.get("superbatch", ""),
                        status=status, trial_status=trial_status,
