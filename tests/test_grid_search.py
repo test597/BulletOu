@@ -503,16 +503,39 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(len(archives),1)
         self.assertTrue(archives[0].name.startswith(old["trials"][1]["name"]))
 
-    def test_extension_rejects_changed_condition_shrink_and_new_values(self):
+    def test_resume_adds_conditions_without_changing_existing_results(self):
+        argv, old = self.saved_scale_grid()
+        before = {p: p.read_bytes() for p in (self.output / "trials").rglob("*") if p.is_file()}
+        requested = [*argv[:-3], "2400", "600", "3000", "--resume"]
+        seen = []
+        def child(command, directory, cwd, trial_id):
+            self.assertNotIn("--resume", command)
+            seen.append(trial_id)
+            self.summary(directory, [self.metrics(epoch=1), self.metrics(epoch=2)])
+            return 0, 1.0
+        with patch.object(grid, "preflight_exe"), patch.object(grid, "run_child", side_effect=child), redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main([*requested, "--dry-run"]), 0)
+            self.assertEqual(grid.read_json(self.output / grid.MANIFEST), old)
+            self.assertEqual(grid.main(requested), 0)
+            self.assertEqual(grid.main(requested), 0)
+        self.assertEqual(seen, [4, 5])
+        merged = grid.read_json(self.output / grid.MANIFEST)
+        self.assertEqual(merged["trials"][:3], old["trials"])
+        self.assertEqual(merged["axes"]["wrm_target_scaling"], [600, 1200, 1800, 2400, 3000])
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.assertEqual({r["trial"] for r in grid.summarize(self.output, merged)[1]}, {1,2,3,4,5})
+
+    def test_extension_rejects_changed_condition_and_shrink(self):
         argv, old = self.saved_scale_grid()
         before = (self.output / grid.MANIFEST).read_bytes()
-        for arguments in ([*argv, "--resume", "--epochs", "1"],
-                          [*argv[:-3], "2400", "--resume", "--epochs", "7"]):
+        for arguments in ([*argv, "--resume", "--epochs", "1"],):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 grid.main(arguments)
         grid.atomic_json(self.settings_path, {**self.common, "lr": 0.0003})
         with self.assertRaisesRegex(ValueError, "training settings changed"):
             grid.main([*argv, "--resume", "--epochs", "7"])
+        with self.assertRaisesRegex(ValueError, "training settings changed outside grid axes"):
+            grid.main([*argv[:-3], "2400", "--resume"])
         self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())
 
     def test_extension_dry_run_and_lock_failure_do_not_write(self):

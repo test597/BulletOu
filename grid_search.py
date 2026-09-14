@@ -399,6 +399,24 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
     report_epochs = set(stored["report_epochs"]) | set(requested["report_epochs"])
     for candidate in requested["trials"]:
         matches = [t for t in merged["trials"] if t["parameters"] == candidate["parameters"]]
+        if not matches:
+            axes = set(stored["axes"])
+            common = lambda s: {k: v for k, v in training_identity(s).items() if k not in axes}
+            if any(common(t["settings"]) != common(candidate["settings"]) for t in stored["trials"]):
+                raise ValueError("existing grid manifest differs: new condition training settings changed outside grid axes")
+            trial = copy.deepcopy(candidate)
+            trial["id"] = max(t["id"] for t in merged["trials"]) + 1
+            trial["name"] = f"trial{trial['id']:04}-" + candidate["name"].split("-", 1)[1]
+            trial["settings"]["output"] = str(root / "trials" / trial["name"])
+            trial["settings"]["tag"] = trial["name"]
+            if trial_dir(root, trial).exists():
+                raise ValueError(f"new condition output already exists: {trial_dir(root, trial)}")
+            merged["trials"].append(trial)
+            for key, value in trial["parameters"].items():
+                if value not in merged["axes"][key]:
+                    merged["axes"][key].append(value)
+            selected.add(trial["id"])
+            continue
         if len(matches) != 1:
             raise ValueError(f"existing grid manifest differs: no unique existing condition for {candidate['parameters']}")
         trial = matches[0]
@@ -560,7 +578,10 @@ def main(argv=None) -> int:
     print(f"[CONFIG] conditions={len(selected)} total_conditions={len(plan['trials'])} report_epochs={plan['report_epochs']} sequential=true", flush=True)
     if stored is not None and args.resume:
         for trial in execution_plan["trials"]:
-            old = next(t for t in stored["trials"] if t["id"] == trial["id"])
+            old = next((t for t in stored["trials"] if t["id"] == trial["id"]), None)
+            if old is None:
+                print(f"[ADD PLAN] trial={trial['id']} parameters={trial['parameters']} output={trial_dir(root, trial)}", flush=True)
+                continue
             print(f"[RESUME PLAN] trial={trial['id']} parameters={trial['parameters']} max_epochs={old['settings']['max_epochs']}->{trial['settings']['max_epochs']} output={trial_dir(root, trial)}", flush=True)
     print("[CONFIG] output/output_folder/tag/resume are controlled per trial; all other common settings are preserved", flush=True)
     print(f"[CONFIG] relative teacher/input paths use cwd={plan['cwd']}", flush=True)

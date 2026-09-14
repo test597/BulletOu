@@ -163,7 +163,8 @@ python .\grid_search.py `
 ```
 
 - `--epochs 10` is the total endpoint, not ten additional epochs. It overrides the common JSON's `max_epochs`, so that file can remain at five.
-- Existing grid arguments select conditions; no separate selection flag is needed. Keep all original axis names and narrow their value lists. Unknown conditions are rejected, not added.
+- Grid arguments select conditions; no separate selection flag is needed. Keep all original axis names, but value lists may be narrowed or expanded. With `--resume`, unknown conditions are appended after the highest existing trial ID. Existing IDs, folders and results stay unchanged. New conditions train from the common initial state and teacher position; completed existing conditions are skipped.
+- Example: after `--grid wrm_target_offset 135 270 540 0`, use `--grid wrm_target_offset 70 35 100 135 170 200 235 270 540 0 --resume` with the same output folder to add six conditions. Unselected existing conditions remain in the manifest and aggregate. Completed new conditions join the same `grid_summary.csv`. Changes to common training settings outside the grid axes are rejected. Add `--dry-run` to inspect the additions without writing files or starting training.
 - Each selected condition resumes its own saved weights, optimizer state and teacher position via native `--resume`. A completed epoch-five checkpoint starts at epoch six; interrupted unsaved progress rolls back to the last checkpoint.
 - IDs and directory names, including their original hashes, stay unchanged. Original `bulletou-settings.json` files stay intact; updated launch settings go into `bulletou-resume-settings.json` and the manifest. The common JSON is never written back.
 - Existing report epochs are preserved and every newly added epoch is included in the same `grid_summary.csv`. With the original epochs 1–5, `--epochs 10` reports 1–10 on extension.
