@@ -114,9 +114,9 @@ grid-target-scale/
 
 短いhashは条件全体から作ります。フォルダ名では省略された条件も `bulletou-settings.json` とmanifestに残ります。再開時だけ、開始state指定を外した `bulletou-resume-settings.json` も作ります。
 
-`grid_summary.csv` は、YOSCと同様に学習開始前から全条件の行を作ります。各行には実験条件・対象epoch・保存先・状態を記録し、条件開始・終了・中断時に再集計します。未開始は `pending`、実行中は `running`、中断は `interrupted`、失敗は `failed` です。**測定結果は指定された最終epoch・最終sbまで完了したtrialだけ**に記入します。未完了trialのacc/loss/qacc/qloss・最大最小値・実測sb・checkpointは空欄のままです。完了trialでも末尾sbが記録されていないepochは掲載しません。途中経過は本体の `summary-learn.csv` や条件ごとの `stdout.log` で確認してください。元ログは変更しません。
+`grid_summary.csv` は、YOSCと同様に学習開始前から全条件の行を作ります。各行には実験条件・対象epoch・保存先・状態を記録し、条件開始・終了・中断時に再集計します。**測定結果はepoch単位で、末尾sbまで記録されたepochに記入します。** trial全体が未完了でも、完了済みepochの結果は表示します。未完了epochのacc/loss/qacc/qloss・最大最小値・実測sb・checkpointだけを空欄にします。途中経過は本体の `summary-learn.csv` や条件ごとの `stdout.log` で確認してください。元ログは変更しません。
 
-延長したtrialは、新しい学習量を完了するまで条件行だけを掲載し、測定結果は空欄にします。最終行と保存checkpointが揃っていれば、runnerの完了状態記録前の中断も完了として回復します（失敗状態を除く）。既存CSVも `--summary-only` または次回起動で、この規則に従って再集計されます。
+例：epoch 1完了後にmax_epochsを3へ延長し、epoch 2の途中なら、epoch 1の測定結果は表示し、epoch 2・3は条件だけ表示します。trialが中断・失敗しても完了済みepochは掲載します。既存CSVも `--summary-only` または次回起動で、この規則に従って再集計されます。
 
 CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです。
 
@@ -128,7 +128,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 | `max_acc_sb`, `min_loss_sb`, `max_qacc_sb`, `min_qloss_sb` | 各最大／最小のsb。同値なら最初のsb |
 | `positions`, `lr_start`, `lr_end` | 本体の最後の行の局面数とLR。`lr_start` はepoch先頭とは限らず、その行の区間の先頭 |
 | `lr`, `lr_min`, `wrm_target_scaling` 等 | 指定した学習条件。grid軸は個別列になる。JSONにない既定値を推測で埋めない |
-| `status` | 掲載対象は末尾sbまで記録されたepochのみで、`done` |
+| `status` | epoch完了は `done`。未完了は `pending` / `running` / `interrupted` / `failed` / `incomplete`。`trial_status`はtrial全体の状態なので異なる場合があります |
 | `trial_status` | 条件全体の実行状態。経過時間 `elapsed_seconds` は集計CSVには出力しない |
 | `output_dir` | 条件の保存先 |
 | `checkpoint` | **末尾列**。その最後の行に対応する保存checkpointのフォルダ。未保存・削除済みなら空欄 |

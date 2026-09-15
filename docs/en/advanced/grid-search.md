@@ -114,9 +114,9 @@ grid-target-scale/
 
 The short hash covers the complete condition; full settings are kept in the per-trial JSON and manifest. Resuming also writes `bulletou-resume-settings.json`, omitting the common initial-state arguments so BulletOu resumes the trial itself.
 
-Like YOSC, the aggregate CSV includes condition rows before training starts, with settings, target epoch, output directory and status. It is rebuilt at trial start/end/interruption. States include `pending`, `running`, `interrupted` and `failed`. **Measured results are populated only for trials that reached their configured final epoch and final sb**. Unfinished trials retain their condition rows, but metrics, extrema, measured sb and checkpoint stay blank. Completed trials' epochs missing their final sb are omitted. Inspect `summary-learn.csv` or `stdout.log` for intermediate measurements. Aggregation never modifies source logs.
+Like YOSC, the aggregate CSV includes condition rows before training starts, with settings, target epoch, output directory and status. It is rebuilt at trial start/end/interruption. **Measurements are populated per epoch when its final sb is recorded**, even if the overall trial remains unfinished. Only unfinished epochs have blank metrics, extrema, measured sb and checkpoint. Inspect `summary-learn.csv` or `stdout.log` for intermediate measurements. Aggregation never modifies source logs.
 
-An extended trial retains condition rows with blank measurements until its new budget completes. A final log row with a saved checkpoint can recover completion after interruption before the runner records completion (except a failed state). Existing aggregate CSVs adopt these rules on the next run or with `--summary-only`.
+Example: after extending a completed epoch 1 to max_epochs=3, while epoch 2 is running, epoch 1 retains its measurements and epochs 2–3 show conditions only. Completed epochs remain visible even if the trial is interrupted or fails. Existing aggregate CSVs adopt these rules on the next run or with `--summary-only`.
 
 One row represents **one condition × one reported epoch**:
 
@@ -128,7 +128,7 @@ One row represents **one condition × one reported epoch**:
 | Corresponding `*_sb` columns | Location of each extremum; first sb on ties |
 | `positions`, `lr_start`, `lr_end` | Last native row's position count and LR interval. `lr_start` need not be the epoch-start LR |
 | `lr`, `lr_min`, `wrm_target_scaling`, etc. | Settings, including individual grid-axis columns. Unspecified executable defaults are not guessed |
-| `status` | Always `done`; only epochs with their final sb are included |
+| `status` | `done` for a completed epoch; otherwise `pending`, `running`, `interrupted`, `failed` or `incomplete`. This may differ from the overall `trial_status` |
 | `trial_status` | Whole-condition state. `elapsed_seconds` is not included in the aggregate CSV |
 | `output_dir` | Condition directory |
 | `checkpoint` | **Last column**: saved checkpoint corresponding to the last row, blank if unsaved or removed |

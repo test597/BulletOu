@@ -453,31 +453,26 @@ def summarize(root: Path, plan: dict, epochs=None) -> tuple[list[str], list[dict
         directory = trial_dir(root, trial)
         state_path = directory / "grid-state.json"
         state = read_json(state_path) if state_path.is_file() else {}
-        # Publish only completed conditions, never partial epoch/trial results.
-        # Reuse resume's completion check, including saved-final-row recovery.
-        if not is_complete(directory, trial, state):
-            status = state.get("status", "pending")
-            if status == "done":
-                status = "incomplete"
-            for epoch in epochs or plan["report_epochs"]:
-                if epoch <= trial["settings"]["max_epochs"]:
-                    row = {key: trial["settings"].get(key, "") for key in parameter_columns}
-                    row.update(trial=trial["id"], epoch=epoch, status=status,
-                               trial_status=status, output_dir=str(directory))
-                    result.append(row)
-            continue
+        trial_status = state.get("status", "pending")
+        if is_complete(directory, trial, state):
+            trial_status = "done"
+        elif trial_status == "done":
+            trial_status = "incomplete"
         rows = log_rows(directory)
-        trial_status = "done"
         for epoch in epochs or plan["report_epochs"]:
             if epoch > trial["settings"]["max_epochs"]:
                 continue  # Unselected conditions were not extended.
             group = [row for row in rows if int(row["epoch"]) == epoch]
             last = group[-1] if group else {}
             closed = last and int(last["superbatch"]) == trial["settings"]["superbatches"]
+            row = {key: trial["settings"].get(key, "") for key in parameter_columns}
             if not closed:
+                row.update(trial=trial["id"], epoch=epoch,
+                           status="incomplete" if trial_status == "done" else trial_status,
+                           trial_status=trial_status, output_dir=str(directory))
+                result.append(row)
                 continue
             status = "done"
-            row = {key: trial["settings"].get(key, "") for key in parameter_columns}
             row.update(trial=trial["id"], epoch=epoch, superbatch=last.get("superbatch", ""),
                        status=status, trial_status=trial_status,
                        output_dir=str(directory),
