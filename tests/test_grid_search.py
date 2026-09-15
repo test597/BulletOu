@@ -55,6 +55,15 @@ class GridSearchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             grid.check_settings({**self.common, "wrm_target_epsilon": 0.01, "loss_sigmoid_mse": True})
 
+    def test_norm_loss_grid_keeps_common_settings_and_reports_strength(self):
+        plan = self.plan(["--grid", "sfnn_norm_loss_strength", "0", "0.00001", "0.0001"])
+        self.assertEqual(len(plan["trials"]), 6)
+        fields, rows = grid.summarize(self.output, plan)
+        self.assertEqual(fields.count("sfnn_norm_loss_strength"), 1)
+        self.assertEqual({r["sfnn_norm_loss_strength"] for r in rows}, {0, 1e-5, 1e-4})
+        for trial in plan["trials"]:
+            self.assertEqual(trial["settings"]["wrm_target_offset"], self.common["wrm_target_offset"])
+
     def complete_plan(self, plan):
         for trial in plan["trials"]:
             directory = grid.trial_dir(self.output, trial)

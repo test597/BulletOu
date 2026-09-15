@@ -5040,6 +5040,11 @@ struct Args {
     #[arg(long = "sfnn-saturation-penalty", default_value = "0.0")]
     sfnn_saturation_penalty: f32,
 
+    /// Decoupled bullet-shogi NormLoss toward tensor L2 norm 1 (0 disables).
+    /// FT weights excluded; FT bias and dense tensors included. Not bucket-wise.
+    #[arg(long, default_value = "0.0")]
+    sfnn_norm_loss_strength: f32,
+
     /// Quantized i8 threshold used by `--sfnn-saturation-penalty`, in QB
     /// units. 127 means only weights that would hit the i8 edge are
     /// penalized; lower values start damping earlier.
@@ -5326,6 +5331,12 @@ impl Args {
         if effective_sfnn_factorizer_axis_count_confidence_enabled(self) && self.sfnn_bucket_counts.is_none() {
             return Err("--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts"
                 .to_string());
+        }
+        if !self.sfnn_norm_loss_strength.is_finite() || self.sfnn_norm_loss_strength < 0.0 {
+            return Err("--sfnn-norm-loss-strength must be finite and non-negative".to_string());
+        }
+        if self.sfnn_norm_loss_strength != 0.0 && !eval_type.uses_layerstack() {
+            return Err("--sfnn-norm-loss-strength requires SFNN / LayerStack".to_string());
         }
         if !(self.sfnn_saturation_penalty.is_finite() && self.sfnn_saturation_penalty >= 0.0) {
             return Err(format!(
@@ -5753,6 +5764,7 @@ fn resolve_wrm_loss_params(args: &Args) -> Result<(), String> {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
+    eprintln!("  SFNN norm loss               = strength={}, target=1, per-tensor, FT weights excluded; L3 bias before RAdam, others after RAdam/before Lookahead", args.sfnn_norm_loss_strength);
     if effective_win_rate_model(args) {
         resolve_wrm_loss_params(args)?;
     } else {
@@ -10799,6 +10811,8 @@ impl WorkerSfnnSession {
                 },
                 lookahead_alpha: ranger.alpha,
                 lookahead_period: ranger.k as u64,
+                norm_loss_strength: 0.0,
+                norm_loss_before: false,
                 clip_after_lookahead: true,
             };
             let lr_multipliers =
@@ -12418,6 +12432,8 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
                 },
                 lookahead_alpha: 0.5,
                 lookahead_period: 6,
+                norm_loss_strength: 0.0,
+                norm_loss_before: false,
                 clip_after_lookahead: true,
             },
             RangerStateMut {
@@ -12452,6 +12468,8 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
                 },
                 lookahead_alpha: 0.5,
                 lookahead_period: 6,
+                norm_loss_strength: 0.0,
+                norm_loss_before: false,
                 clip_after_lookahead: true,
             },
             RangerDeviceStateMut {
@@ -13363,6 +13381,8 @@ fn run_cuda_cpp_kppt_component_direct_steps(
                 },
                 lookahead_alpha: ranger.alpha,
                 lookahead_period: ranger.k as u64,
+                norm_loss_strength: 0.0,
+                norm_loss_before: false,
                 clip_after_lookahead: true,
             }
         };
@@ -14151,6 +14171,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             },
                             lookahead_alpha: ranger.alpha,
                             lookahead_period: ranger.k as u64,
+                            norm_loss_strength: 0.0,
+                            norm_loss_before: false,
                             clip_after_lookahead: true,
                         };
                         let batch = NnueTrainStepHostBatch {
@@ -14440,6 +14462,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 },
                 lookahead_alpha: ranger.alpha,
                 lookahead_period: ranger.k as u64,
+                norm_loss_strength: 0.0,
+                norm_loss_before: false,
                 clip_after_lookahead: true,
             }
         };
@@ -17493,6 +17517,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         },
                         lookahead_alpha: ranger.alpha,
                         lookahead_period: ranger.k as u64,
+                        norm_loss_strength: 0.0,
+                        norm_loss_before: false,
                         clip_after_lookahead: true,
                     };
                     let batch = SfnnTrainStepHostBatch {
@@ -17852,6 +17878,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 },
                 lookahead_alpha: ranger.alpha,
                 lookahead_period: ranger.k as u64,
+                norm_loss_strength: 0.0,
+                norm_loss_before: false,
                 clip_after_lookahead: true,
             }
         };
@@ -24278,6 +24306,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
     _progress: Option<CudaCppScheduleProgress>,
 ) -> bulletou_cuda_cpp::SfnnLayerLrMultipliers {
     let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers {
+        norm_loss_strength: args.sfnn_norm_loss_strength,
         l1: args.sfnn_l1_lr_mult,
         update_scope: args.sfnn_update_scope.into(),
         factorizer_residual_decay: args.sfnn_factorizer_residual_decay,
@@ -24926,6 +24955,7 @@ fn resume_signature(args: &Args) -> String {
             effective_sfnn_hand_progress_pair_count_confidence(args)
         ),
         format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),
+        format!("sfnn_norm_loss_strength={:.9}", args.sfnn_norm_loss_strength),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_qat_l1={}", args.sfnn_qat_l1),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
@@ -25155,6 +25185,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_saturation_penalty=",
         "sfnn_saturation_threshold=127.000000000",
     );
+    ensure_line_after(&mut out, "sfnn_norm_loss_strength=", "sfnn_saturation_penalty=", "sfnn_norm_loss_strength=0.000000000");
     ensure_line_after(&mut out, "sfnn_qat_l1=", "sfnn_saturation_threshold=", "sfnn_qat_l1=false");
     ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_qat_l1=", "sfnn_l1_lr_mult=1.000000000");
     ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
@@ -33214,6 +33245,25 @@ mod tests {
         let disabled =
             Args::try_parse_from(["bulletou", "--teacher", "/dev/null", "--optimizer-weight-clip", "0"]).unwrap();
         assert_eq!(ranger_params(&disabled).max_weight, f32::MAX);
+    }
+
+    #[test]
+    fn norm_loss_cli_json_and_legacy_resume() {
+        let mut argv: Vec<std::ffi::OsString> = ["bulletou", "--teacher", "/dev/null", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--superbatches", "1", "--max-epochs", "1"].map(Into::into).to_vec();
+        let base = Args::try_parse_from(argv.clone()).unwrap();
+        assert_eq!(base.sfnn_norm_loss_strength, 0.0);
+        let old = resume_signature_without_line(&resume_signature(&base), "sfnn_norm_loss_strength=");
+        assert!(resume_signature_matches(&old, &base));
+        bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"), "sfnn_norm_loss_strength", &serde_json::json!(0.0001), &mut argv).unwrap();
+        let mut enabled = Args::try_parse_from(argv).unwrap();
+        assert_eq!(enabled.sfnn_norm_loss_strength, 1e-4);
+        assert!(enabled.validate_backend_flags().is_ok());
+        assert_eq!(cuda_cpp_sfnn_layer_lr_multipliers(&enabled, None).norm_loss_strength, 1e-4);
+        assert!(!resume_signature_matches(&old, &enabled));
+        for invalid in [-1.0, f32::NAN, f32::INFINITY] {
+            enabled.sfnn_norm_loss_strength = invalid;
+            assert!(enabled.validate_cuda_cpp_backend_options().is_err());
+        }
     }
 
     #[test]

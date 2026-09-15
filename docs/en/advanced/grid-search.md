@@ -1,5 +1,7 @@
 # Compare training conditions with grid search
 
+Use `--grid sfnn_norm_loss_strength 0 0.000001 0.00001 0.0001` to compare SFNN norm regularization. See [Norm loss: scope, formula and examples](norm-loss.md).
+
 [日本語](../../ja/advanced/grid-search.md)
 
 ## Compare WRM teacher-probability compression

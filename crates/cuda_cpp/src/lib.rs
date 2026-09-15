@@ -6156,6 +6156,7 @@ impl SfnnUpdateScope {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SfnnLayerLrMultipliers {
+    pub norm_loss_strength: f32,
     pub l0: f32,
     pub l1: f32,
     pub l2: f32,
@@ -6174,6 +6175,7 @@ pub struct SfnnLayerLrMultipliers {
 impl Default for SfnnLayerLrMultipliers {
     fn default() -> Self {
         Self {
+            norm_loss_strength: 0.0,
             l0: 1.0,
             l1: 1.0,
             l2: 1.0,
@@ -6190,6 +6192,9 @@ impl Default for SfnnLayerLrMultipliers {
 
 impl SfnnLayerLrMultipliers {
     pub fn validate(self) -> Result<()> {
+        if !self.norm_loss_strength.is_finite() || self.norm_loss_strength < 0.0 {
+            return Err(CudaCppError::message("SFNN norm loss strength must be finite and non-negative"));
+        }
         for (name, value) in [("l0", self.l0), ("l1", self.l1), ("l2", self.l2), ("l3", self.l3)] {
             if !(value.is_finite() && value >= 0.0) {
                 return Err(CudaCppError::message(format!(
@@ -6231,6 +6236,13 @@ impl SfnnLayerLrMultipliers {
         layer: SfnnUpdateLayer,
         kind: SfnnUpdateParamKind,
     ) -> RangerUpdateParams {
+        params.norm_loss_strength = if matches!((layer, kind), (SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight)) {
+            0.0
+        } else {
+            self.norm_loss_strength
+        };
+        params.norm_loss_before = params.norm_loss_strength != 0.0
+            && matches!((layer, kind), (SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias));
         if self.tatara_weight_clip {
             // FT uses i16; the output bias uses i32. L1/L2 biases deliberately
             // share the dense-weight bound, matching tatara's LayerStack trainer.
@@ -8686,6 +8698,8 @@ impl RAdamUpdateParams {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RangerUpdateParams {
+    pub norm_loss_strength: f32,
+    pub norm_loss_before: bool,
     pub radam: RAdamUpdateParams,
     pub lookahead_alpha: f32,
     pub lookahead_period: u64,
@@ -8696,6 +8710,8 @@ pub struct RangerUpdateParams {
 impl Default for RangerUpdateParams {
     fn default() -> Self {
         Self {
+            norm_loss_strength: 0.0,
+            norm_loss_before: false,
             radam: RAdamUpdateParams { decay: 0.0, ..RAdamUpdateParams::default() },
             lookahead_alpha: 0.5,
             lookahead_period: 6,
@@ -8705,7 +8721,21 @@ impl Default for RangerUpdateParams {
 }
 
 impl RangerUpdateParams {
+    // bullet-shogi Ranger21's NormLoss LR convention; the optimizer stays RAdam.
+    fn norm_loss_rate(self) -> f32 {
+        if self.norm_loss_strength == 0.0 { return 0.0; }
+        let p = self.radam;
+        let lr = if self.norm_loss_before { p.learning_rate } else {
+            let t = p.step as f32;
+            p.learning_rate * (1.0 - p.beta2.powf(t)).sqrt()
+                / ((1.0 - p.beta1.powf(t)) * ((1.0 + p.beta2).powi(2) + p.beta2.powi(2)).sqrt())
+        };
+        2.0 * self.norm_loss_strength * lr
+    }
     pub fn validate(self) -> Result<()> {
+        if !self.norm_loss_strength.is_finite() || self.norm_loss_strength < 0.0 {
+            return Err(CudaCppError::message("norm loss strength must be finite and non-negative"));
+        }
         self.radam.validate()?;
         if !(self.lookahead_alpha.is_finite() && (0.0..=1.0).contains(&self.lookahead_alpha)) {
             Err(CudaCppError::message("Ranger lookahead_alpha must be finite and in [0, 1]"))
@@ -8828,6 +8858,9 @@ impl RangerStackedDirtyDeviceStateMut<'_> {
 }
 
 pub fn ranger_update_host(device: i32, params: RangerUpdateParams, state: RangerStateMut<'_>) -> Result<()> {
+    if params.norm_loss_strength != 0.0 {
+        return Err(CudaCppError::message("Norm loss is supported by device SFNN updates only"));
+    }
     params.validate()?;
     let len = state.validate()?;
     let scale = params.radam.step_scale()?;
@@ -8870,6 +8903,8 @@ pub fn ranger_update_device(ctx: &Context, params: RangerUpdateParams, state: Ra
     check(unsafe {
         ffi::bulletou_cuda_cpp_ranger_update_device(
             ctx.as_ptr(),
+            params.norm_loss_rate(),
+            i32::from(params.norm_loss_before),
             len,
             params.radam.gradient_factor,
             params.radam.learning_rate,
@@ -8910,6 +8945,8 @@ pub fn ranger_update_stacked_dirty_device(
     check(unsafe {
         ffi::bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
             ctx.as_ptr(),
+            params.norm_loss_rate(),
+            i32::from(params.norm_loss_before),
             len,
             state.stride,
             state.dirty_count,
@@ -9775,6 +9812,8 @@ mod ffi {
         ) -> i32;
         pub fn bulletou_cuda_cpp_ranger_update_device(
             ctx: *mut BulletOuCudaCppContext,
+            norm_loss_rate: f32,
+            norm_loss_before: i32,
             len: usize,
             gradient_factor: f32,
             learning_rate: f32,
@@ -9797,6 +9836,8 @@ mod ffi {
         ) -> i32;
         pub fn bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
             ctx: *mut BulletOuCudaCppContext,
+            norm_loss_rate: f32,
+            norm_loss_before: i32,
             len: usize,
             stride: usize,
             dirty_count: usize,
@@ -9825,6 +9866,7 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    mod norm_loss_tests;
     mod validation_stats {
         include!("validation_stats_tests.rs");
     }
@@ -11058,6 +11100,7 @@ mod tests {
                         lookahead_alpha: 0.5,
                         lookahead_period: 6,
                         clip_after_lookahead: true,
+                        ..Default::default()
                     },
                     ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
                     1.0,
@@ -11116,6 +11159,7 @@ mod tests {
             lookahead_alpha: 0.5,
             lookahead_period: 6,
             clip_after_lookahead: true,
+            ..Default::default()
         };
         let expected_gradients = tiny_sfnn_backward_cpu(batch, weights, &targets, &entry_weights);
         let expected = host_ranger_updated_tiny_sfnn_weights(0, weights, &expected_gradients, params);

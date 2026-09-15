@@ -1,5 +1,7 @@
 # Grid searchで学習条件を比較する
 
+SFNNのノルム正則化も `--grid sfnn_norm_loss_strength 0 0.000001 0.00001 0.0001` で比較できます。[Norm lossの対象・計算式・実行例](norm-loss.md)を参照してください。
+
 [English](../../en/advanced/grid-search.md)
 
 ## WRM教師勝率の圧縮を比較する

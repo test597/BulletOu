@@ -16,6 +16,7 @@ namespace {
 thread_local std::string g_last_error;
 
 struct BulletOuCudaCppContext {
+    float* norm_loss_scratch = nullptr;
     int device = 0;
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
@@ -7150,6 +7151,7 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
         delete ctx;
         return -1;
     }
+    if (ctx->norm_loss_scratch != nullptr) cudaFree(ctx->norm_loss_scratch);
     if (ctx->blas != nullptr) {
         cublasStatus_t blas_status = cublasDestroy(ctx->blas);
         if (blas_status != CUBLAS_STATUS_SUCCESS) {
@@ -7809,8 +7811,48 @@ extern "C" int bulletou_cuda_cpp_axpy_device(
     return ok();
 }
 
+// One norm per complete tensor, including every stack. No host readback.
+__global__ void norm_loss_sum_kernel(const float* w, size_t n, float* sums) {
+    __shared__ float values[256];
+    float sum = 0.0f;
+    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n; i += 256 * 256)
+        sum += w[i] * w[i];
+    values[threadIdx.x] = sum;
+    __syncthreads();
+    for (int d = 128; d; d /= 2) {
+        if (threadIdx.x < d) values[threadIdx.x] += values[threadIdx.x + d];
+        __syncthreads();
+    }
+    if (!threadIdx.x) sums[blockIdx.x] = values[0];
+}
+__global__ void norm_loss_scale_kernel(float* w, size_t n, const float* sums, float rate) {
+    __shared__ float values[256];
+    values[threadIdx.x] = sums[threadIdx.x];
+    __syncthreads();
+    for (int d = 128; d; d /= 2) {
+        if (threadIdx.x < d) values[threadIdx.x] += values[threadIdx.x + d];
+        __syncthreads();
+    }
+    const float scale = 1.0f - rate * (1.0f - 1.0f / (sqrtf(values[0]) + 1.0e-7f));
+    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n; i += gridDim.x * 256)
+        w[i] *= scale;
+}
+int apply_norm_loss(BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* w, size_t n, float rate) {
+    if (rate == 0.0f || n == 0) return 0;
+    if (ctx->norm_loss_scratch == nullptr) {
+        auto err = cudaMalloc(reinterpret_cast<void**>(&ctx->norm_loss_scratch), 256 * sizeof(float));
+        if (err != cudaSuccess) return fail("cudaMalloc norm loss scratch", err);
+    }
+    norm_loss_sum_kernel<<<256, 256, 0, ctx->stream>>>(w->ptr, n, ctx->norm_loss_scratch);
+    if (check_kernel_launch("norm loss sum") != 0) return -1;
+    norm_loss_scale_kernel<<<256, 256, 0, ctx->stream>>>(w->ptr, n, ctx->norm_loss_scratch, rate);
+    return check_kernel_launch("norm loss scale");
+}
+
 extern "C" int bulletou_cuda_cpp_ranger_update_device(
     BulletOuCudaCppContext* ctx,
+    float norm_loss_rate,
+    int norm_loss_before,
     size_t len,
     float gradient_factor,
     float learning_rate,
@@ -7849,6 +7891,7 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
     if (block_count_1d(update_threads, threads, &blocks, "radam_update_reset_gradients_kernel") != 0) {
         return -1;
     }
+    if (norm_loss_before && apply_norm_loss(ctx, weights, len, norm_loss_rate) != 0) return -1;
     if (use_vec4) {
         radam_update_reset_gradients_vec4_kernel<<<blocks, threads, 0, ctx->stream>>>(
             gradients->ptr,
@@ -7891,6 +7934,7 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
         }
     }
 
+    if (!norm_loss_before && apply_norm_loss(ctx, weights, len, norm_loss_rate) != 0) return -1;
     if (do_lookahead != 0) {
         const float lookahead_min = clip_after_lookahead ? min_weight : -FLT_MAX;
         const float lookahead_max = clip_after_lookahead ? max_weight : FLT_MAX;
@@ -7914,6 +7958,8 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
 
 extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
     BulletOuCudaCppContext* ctx,
+    float norm_loss_rate,
+    int norm_loss_before,
     size_t len,
     size_t stride,
     size_t dirty_count,
@@ -7987,6 +8033,7 @@ extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
         return ok();
     }
 
+    if (norm_loss_before && apply_norm_loss(ctx, weights, len, norm_loss_rate) != 0) return -1;
     if (use_vec4) {
         radam_update_reset_gradients_stacked_dirty_vec4_kernel<<<blocks, threads, 0, ctx->stream>>>(
             dirty_buckets->ptr,
@@ -8035,6 +8082,7 @@ extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
         }
     }
 
+    if (!norm_loss_before && apply_norm_loss(ctx, weights, len, norm_loss_rate) != 0) return -1;
     if (do_lookahead != 0) {
         const float lookahead_min = clip_after_lookahead ? min_weight : -FLT_MAX;
         const float lookahead_max = clip_after_lookahead ? max_weight : FLT_MAX;
