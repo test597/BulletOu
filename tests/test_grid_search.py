@@ -551,6 +551,21 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(before, {p: p.read_bytes() for p in before})
         self.assertEqual({r["trial"] for r in grid.summarize(self.output, merged)[1]}, {1,2,3,4,5})
 
+    def test_resume_error_lists_changes_without_writing(self):
+        argv, old = self.saved_scale_grid()
+        before = (self.output / grid.MANIFEST).read_bytes()
+        grid.atomic_json(self.settings_path, {**self.common, "batches_per_update": 4, "lr": 0.0003})
+        with self.assertRaises(ValueError) as error:
+            grid.main([*argv, "--resume", "--epochs", "3"])
+        message = str(error.exception)
+        self.assertIn("batches_per_update: saved=<not specified>, requested=4", message)
+        self.assertIn("lr: saved=0.001, requested=0.0003", message)
+        self.assertNotIn("max_epochs: saved=", message)
+        self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())
+        self.assertEqual(grid.settings_diff({"batches_per_update": 1}, {"batches_per_update": 4}),
+                         "  batches_per_update: saved=1, requested=4")
+        self.assertIn("saved=null, requested=<not specified>", grid.settings_diff({"x": None}, {}))
+
     def test_extension_rejects_changed_condition_and_shrink(self):
         argv, old = self.saved_scale_grid()
         before = (self.output / grid.MANIFEST).read_bytes()

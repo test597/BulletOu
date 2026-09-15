@@ -375,6 +375,17 @@ def training_identity(settings: dict) -> dict:
     return {k: v for k, v in settings.items() if k not in {"output", "tag", "max_epochs"}}
 
 
+def settings_diff(saved: dict, requested: dict) -> str:
+    """Diagnostic only: retain the existing comparison/acceptance rules."""
+    def value(settings, key):
+        return json.dumps(settings[key], ensure_ascii=False) if key in settings else "<not specified>"
+    return "\n".join(
+        f"  {key}: saved={value(saved, key)}, requested={value(requested, key)}"
+        for key in sorted(saved.keys() | requested.keys())
+        if key not in saved or key not in requested or saved[key] != requested[key]
+    )
+
+
 def check_trial_settings_file(directory: Path, trial: dict) -> None:
     path = directory / "bulletou-settings.json"
     if not path.exists():
@@ -402,8 +413,14 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
         if not matches:
             axes = set(stored["axes"])
             common = lambda s: {k: v for k, v in training_identity(s).items() if k not in axes}
-            if any(common(t["settings"]) != common(candidate["settings"]) for t in stored["trials"]):
-                raise ValueError("existing grid manifest differs: new condition training settings changed outside grid axes")
+            for existing in stored["trials"]:
+                if common(existing["settings"]) != common(candidate["settings"]):
+                    raise ValueError(
+                        "existing grid manifest differs: new condition training settings changed outside grid axes"
+                        f" (compared with trial {existing['id']})\n"
+                        + settings_diff(common(existing["settings"]), common(candidate["settings"]))
+                        + "\nRestore the saved common settings or use a different --output-folder. Nothing was overwritten."
+                    )
             trial = copy.deepcopy(candidate)
             trial["id"] = max(t["id"] for t in merged["trials"]) + 1
             trial["name"] = f"trial{trial['id']:04}-" + candidate["name"].split("-", 1)[1]
@@ -422,7 +439,11 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
         trial = matches[0]
         old, new = trial["settings"]["max_epochs"], candidate["settings"]["max_epochs"]
         if training_identity(trial["settings"]) != training_identity(candidate["settings"]):
-            raise ValueError(f"existing grid manifest differs: trial {trial['id']} training settings changed; only max_epochs may increase")
+            raise ValueError(
+                f"existing grid manifest differs: trial {trial['id']} training settings changed; only max_epochs may increase\n"
+                + settings_diff(training_identity(trial["settings"]), training_identity(candidate["settings"]))
+                + "\nRestore the saved values to resume this trial, or use a different --output-folder for changed settings. Nothing was overwritten."
+            )
         if new < old:
             raise ValueError(f"cannot reduce trial {trial['id']} max_epochs from {old} to {new}; use --epochs {old} or higher")
         directory = trial_dir(root, trial)
