@@ -1,5 +1,7 @@
 # Grid searchで学習条件を比較する
 
+BCEとの比較は `--grid loss_bce_with_logits false true` で指定できます。共通設定の `wrm_in_offset` は0にし、明示的な `win_rate_model` / `loss_sigmoid_mse` は無効にしてください。[BCEの計算式・注意点](bce-with-logits.md)を参照してください。
+
 SFNNのノルム正則化も `--grid sfnn_norm_loss_strength 0 0.000001 0.00001 0.0001` で比較できます。[Norm lossの対象・計算式・実行例](norm-loss.md)を参照してください。
 
 [English](../../en/advanced/grid-search.md)

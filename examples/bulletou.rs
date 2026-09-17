@@ -1271,6 +1271,10 @@ struct QuantizedTestArgs {
     #[arg(long = "loss-sigmoid-mse", conflicts_with = "win_rate_model")]
     loss_sigmoid_mse: bool,
 
+    /// Use BCE with logits and WRM teacher targets; requires --wrm-in-offset 0.
+    #[arg(long, conflicts_with_all = ["loss_sigmoid_mse", "win_rate_model"])]
+    loss_bce_with_logits: bool,
+
     /// WRM prediction-side output scale for train-scale raw output:
     /// `score_net = raw/(QA*QB) * N`.
     #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
@@ -1425,6 +1429,10 @@ struct CompareSfnnQuantizationArgs {
     /// Force plain sigmoid probability loss instead of WRM for loss reporting.
     #[arg(long = "loss-sigmoid-mse", conflicts_with = "win_rate_model")]
     loss_sigmoid_mse: bool,
+
+    /// Use BCE with logits and WRM teacher targets; requires --wrm-in-offset 0.
+    #[arg(long, conflicts_with_all = ["loss_sigmoid_mse", "win_rate_model"])]
+    loss_bce_with_logits: bool,
 
     /// WRM prediction-side output scale for train-scale raw output.
     #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
@@ -1792,6 +1800,7 @@ impl QuantizedTestArgs {
             return Err(format!("--wrm-target-scaling must be finite and > 0 (got {})", self.wrm_target_scaling));
         }
         validate_wrm_target_epsilon(self.wrm_target_epsilon, !self.loss_sigmoid_mse)?;
+        validate_bce_options(self.loss_bce_with_logits, self.wrm_in_offset, self.loss_pow_exp)?;
         if !self.engine_score_offset.is_finite() {
             return Err(format!("--engine-score-offset must be finite (got {})", self.engine_score_offset));
         }
@@ -1872,6 +1881,7 @@ impl CompareSfnnQuantizationArgs {
 
     fn training_args(&self) -> Result<Args, String> {
         validate_wrm_target_epsilon(self.wrm_target_epsilon, !self.loss_sigmoid_mse)?;
+        validate_bce_options(self.loss_bce_with_logits, self.wrm_in_offset, self.loss_pow_exp)?;
         let raw = vec![
             "bulletou".to_string(),
             "--backend".to_string(),
@@ -1912,6 +1922,7 @@ impl CompareSfnnQuantizationArgs {
         if self.loss_sigmoid_mse {
             parsed.loss_sigmoid_mse = true;
         }
+        parsed.loss_bce_with_logits = self.loss_bce_with_logits;
         Ok(parsed)
     }
 
@@ -1931,6 +1942,7 @@ impl CompareSfnnQuantizationArgs {
             loss_pow_exp: self.loss_pow_exp,
             win_rate_model: self.win_rate_model,
             loss_sigmoid_mse: self.loss_sigmoid_mse,
+            loss_bce_with_logits: self.loss_bce_with_logits,
             wrm_nnue2score: self.wrm_nnue2score,
             wrm_in_offset: self.wrm_in_offset,
             wrm_in_scaling: self.wrm_in_scaling,
@@ -2102,6 +2114,7 @@ impl AverageSfnnStateArgs {
             loss_pow_exp: self.loss_pow_exp,
             win_rate_model: false,
             loss_sigmoid_mse: false,
+            loss_bce_with_logits: false,
             wrm_nnue2score: DEFAULT_WRM_NNUE2SCORE,
             wrm_in_offset: DEFAULT_WRM_IN_OFFSET,
             wrm_in_scaling: DEFAULT_WRM_IN_SCALING,
@@ -2233,6 +2246,10 @@ struct QuantizedCalibrateArgs {
     #[arg(long = "loss-sigmoid-mse", conflicts_with = "win_rate_model")]
     loss_sigmoid_mse: bool,
 
+    /// Use BCE with logits and WRM teacher targets; requires --wrm-in-offset 0.
+    #[arg(long, conflicts_with_all = ["loss_sigmoid_mse", "win_rate_model"])]
+    loss_bce_with_logits: bool,
+
     /// WRM prediction-side output scale for train-scale raw output:
     /// `score_net = raw/(QA*QB) * N`.
     #[arg(long, default_value_t = DEFAULT_WRM_NNUE2SCORE)]
@@ -2322,6 +2339,7 @@ impl QuantizedCalibrateArgs {
             loss_pow_exp: self.loss_pow_exp,
             win_rate_model: self.win_rate_model,
             loss_sigmoid_mse: self.loss_sigmoid_mse,
+            loss_bce_with_logits: self.loss_bce_with_logits,
             wrm_nnue2score: self.wrm_nnue2score,
             wrm_in_offset: self.wrm_in_offset,
             wrm_in_scaling: self.wrm_in_scaling,
@@ -4710,6 +4728,10 @@ struct Args {
     #[arg(long = "loss-sigmoid-mse", conflicts_with = "win_rate_model")]
     loss_sigmoid_mse: bool,
 
+    /// Use BCE with logits and WRM teacher targets; requires --wrm-in-offset 0.
+    #[arg(long, conflicts_with_all = ["loss_sigmoid_mse", "win_rate_model"])]
+    loss_bce_with_logits: bool,
+
     /// Exponent of the probability-space error term `|prediction - target|^p`.
     /// `2.0` is squared error; `1.5`, `2.5`, etc. are experiment knobs.
     #[arg(long, default_value = "2.0")]
@@ -5398,6 +5420,7 @@ impl Args {
         if !(self.wrm_target_scaling.is_finite() && self.wrm_target_scaling > 0.0) {
             return Err(format!("--wrm-target-scaling must be finite and > 0 (got {})", self.wrm_target_scaling));
         }
+        validate_bce_options(self.loss_bce_with_logits, self.wrm_in_offset, self.loss_pow_exp)?;
         validate_wrm_target_epsilon(self.wrm_target_epsilon, effective_win_rate_model(self))?;
         if let Some(scale) = self.scale {
             if !(scale.is_finite() && scale > 0.0) {
@@ -5627,6 +5650,9 @@ impl Args {
 }
 
 fn validation_loss_kind(args: &Args) -> ValidationLossKind {
+    if args.loss_bce_with_logits {
+        return ValidationLossKind::BceWithLogits { nnue2score: args.wrm_nnue2score, in_scaling: args.wrm_in_scaling, target: effective_wrm_target_params(args) };
+    }
     if effective_win_rate_model(args) {
         let target = effective_wrm_target_params(args);
         ValidationLossKind::WinRateModel {
@@ -5642,6 +5668,8 @@ fn validation_loss_kind(args: &Args) -> ValidationLossKind {
 }
 
 fn effective_win_rate_model(args: &Args) -> bool {
+    // BCE also uses WRM teacher targets and nnue2score/in_scaling.
+    // Its prediction-side loss is selected separately by the loss-kind helpers.
     args.win_rate_model || !args.loss_sigmoid_mse
 }
 
@@ -5659,6 +5687,12 @@ fn effective_wrm_in_offset(args: &Args) -> f32 {
 
 fn effective_wrm_in_scaling(args: &Args) -> f32 {
     args.wrm_in_scaling
+}
+
+fn validate_bce_options(enabled: bool, offset: f32, pow_exp: f32) -> Result<(), String> {
+    if enabled && offset != 0.0 { return Err("--loss-bce-with-logits requires --wrm-in-offset 0 (standard sigmoid logits)".into()); }
+    if enabled && pow_exp != 2.0 { return Err("--loss-pow-exp does not apply to BCE; leave it at its default 2".into()); }
+    Ok(())
 }
 
 fn validate_wrm_target_epsilon(epsilon: f32, wrm: bool) -> Result<(), String> {
@@ -5764,6 +5798,9 @@ fn resolve_wrm_loss_params(args: &Args) -> Result<(), String> {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
+    if args.loss_bce_with_logits {
+        print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
+    }
     eprintln!("  SFNN norm loss               = strength={}, target=1, per-tensor, FT weights excluded; L3 bias before RAdam, others after RAdam/before Lookahead", args.sfnn_norm_loss_strength);
     if effective_win_rate_model(args) {
         resolve_wrm_loss_params(args)?;
@@ -5787,6 +5824,7 @@ fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
+    if args.loss_bce_with_logits { return bulletou_cuda_cpp::ScalarLossKind::BceWithLogits; }
     if effective_win_rate_model(args) {
         bulletou_cuda_cpp::ScalarLossKind::WinRateModel {
             pow_exp: effective_loss_pow_exp(args),
@@ -5798,6 +5836,7 @@ fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
 }
 
 fn value_loss_label(args: &Args) -> String {
+    if args.loss_bce_with_logits { return format!("bce-with-logits(nnue2score={}, in_scaling={}, target={}/{}, epsilon={})", args.wrm_nnue2score, args.wrm_in_scaling, args.wrm_target_offset, args.wrm_target_scaling, args.wrm_target_epsilon); }
     let pow_exp = effective_loss_pow_exp(args);
     if effective_win_rate_model(args) {
         let target = effective_wrm_target_params(args);
@@ -5847,6 +5886,7 @@ fn sigmoid_loss_label_plain(pow_exp: f32, scale: f32) -> String {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_loss_label(args: &QuantizedTestArgs) -> String {
+    if args.loss_bce_with_logits { return format!("bce-with-logits(train_nnue2score={}, engine_nnue2score=1, in_scaling={}, target={}/{}, epsilon={})", args.wrm_nnue2score, args.wrm_in_scaling, args.wrm_target_offset, args.wrm_target_scaling, args.wrm_target_epsilon); }
     if quantized_effective_win_rate_model(args) {
         return format!(
             "win-rate-model(pow_exp={:.3}, train_nnue2score={:.3}, engine_nnue2score=1.000, in={:.1}/{:.1}, target={:.1}/{:.1})",
@@ -6737,6 +6777,7 @@ fn quantized_wrm_target_params(args: &QuantizedTestArgs) -> bulletou_lib::value:
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_train_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKind {
+    if args.loss_bce_with_logits { return ValidationLossKind::BceWithLogits { nnue2score: args.wrm_nnue2score, in_scaling: args.wrm_in_scaling, target: quantized_wrm_target_params(args) }; }
     if quantized_effective_win_rate_model(args) {
         ValidationLossKind::WinRateModel {
             pow_exp: args.loss_pow_exp,
@@ -6752,6 +6793,7 @@ fn quantized_train_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKi
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_engine_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKind {
+    if args.loss_bce_with_logits { return ValidationLossKind::BceWithLogits { nnue2score: 1.0, in_scaling: args.wrm_in_scaling, target: quantized_wrm_target_params(args) }; }
     if quantized_effective_win_rate_model(args) {
         ValidationLossKind::WinRateModel {
             pow_exp: args.loss_pow_exp,
@@ -7616,10 +7658,11 @@ fn validation_diag_sample_loss(
             let inv_scale = if eval_scale > 0.0 { 1.0 / eval_scale } else { 0.0025 };
             validation_diag_sigmoid(inv_scale * f32::from(teacher_score))
         }
-        ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(teacher_score)),
+        ValidationLossKind::WinRateModel { target, .. } | ValidationLossKind::BceWithLogits { target, .. } => target.probability(f32::from(teacher_score)),
     };
     let target = blend * result_norm + (1.0 - blend) * score_norm;
     let model_p = match loss_kind {
+        ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => validation_diag_sigmoid(model_output * nnue2score / in_scaling),
         ValidationLossKind::SigmoidPow { .. } => {
             let model_inv_scale = if model_output_scale > 0.0 { 1.0 / model_output_scale } else { 1.0 };
             validation_diag_sigmoid(model_output * model_inv_scale)
@@ -7630,6 +7673,7 @@ fn validation_diag_sample_loss(
     };
     let diff = model_p - target;
     match loss_kind {
+        ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => bulletou_lib::validate::bce_with_logits(model_output * nnue2score / in_scaling, target),
         ValidationLossKind::SigmoidPow { pow_exp } | ValidationLossKind::WinRateModel { pow_exp, .. } => {
             diff.abs().powf(pow_exp)
         }
@@ -8542,6 +8586,7 @@ fn quantized_test_args_from_training_args(args: &Args, nn_bin: PathBuf) -> Resul
         loss_pow_exp: effective_loss_pow_exp(args),
         win_rate_model: args.win_rate_model,
         loss_sigmoid_mse: args.loss_sigmoid_mse,
+        loss_bce_with_logits: args.loss_bce_with_logits,
         wrm_nnue2score: effective_wrm_nnue2score(args),
         wrm_in_offset: effective_wrm_in_offset(args),
         wrm_in_scaling: effective_wrm_in_scaling(args),
@@ -9509,7 +9554,7 @@ fn build_quantized_calibration_prepared(
             let score = f32::from(teacher_scores[i]);
             let score_norm = match loss_kind {
                 ValidationLossKind::SigmoidPow { .. } => quantized_calibration_sigmoid(inv_scale * score),
-                ValidationLossKind::WinRateModel { target, .. } => target.probability(score),
+                ValidationLossKind::WinRateModel { target, .. } | ValidationLossKind::BceWithLogits { target, .. } => target.probability(score),
             };
             (i, blend * result_norm + (1.0 - blend) * score_norm)
         })
@@ -9571,6 +9616,7 @@ fn quantized_calibration_engine_report_from_outputs(
             let model_score = quantized_final_division(raw, args.fv_scale, args.quant_final_div_round) as f32;
             let model_p = match loss_kind {
                 ValidationLossKind::SigmoidPow { .. } => quantized_calibration_sigmoid(model_score * model_inv_scale),
+                ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => quantized_calibration_sigmoid(model_score * nnue2score / in_scaling),
                 ValidationLossKind::WinRateModel { nnue2score, in_offset, in_scaling, .. } => {
                     let score_net = model_score * nnue2score;
                     let q = quantized_calibration_sigmoid((score_net - in_offset) / in_scaling);
@@ -9579,7 +9625,10 @@ fn quantized_calibration_engine_report_from_outputs(
                 }
             };
             let diff = model_p - target;
-            loss_sum += diff.abs().powf(args.loss_pow_exp);
+            loss_sum += match loss_kind {
+                ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => bulletou_lib::validate::bce_with_logits(model_score * nnue2score / in_scaling, target),
+                _ => diff.abs().powf(args.loss_pow_exp),
+            };
         }
         report.test_loss = Some(loss_sum / report.loss_sampled as f32);
     }
@@ -24883,6 +24932,7 @@ fn resume_signature(args: &Args) -> String {
         format!("scale={:.6}", effective_scale(args)),
         format!("fv_scale={fv_scale_signature}"),
         format!("win_rate_model={}", effective_win_rate_model(args)),
+        format!("loss_bce_with_logits={}", args.loss_bce_with_logits),
         format!("loss_pow_exp={:.9}", effective_loss_pow_exp(args)),
         format!("wrm_nnue2score={:.9}", effective_wrm_nnue2score(args)),
         format!("wrm_in_offset={:.9}", effective_wrm_in_offset(args)),
@@ -25078,7 +25128,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "quantized_validation_rate=",
         "quantized_validation_exact=false",
     );
-    ensure_line_after(&mut out, "loss_pow_exp=", "win_rate_model=", "loss_pow_exp=2.000000000");
+    ensure_line_after(&mut out, "loss_bce_with_logits=", "win_rate_model=", "loss_bce_with_logits=false");
+    ensure_line_after(&mut out, "loss_pow_exp=", "loss_bce_with_logits=", "loss_pow_exp=2.000000000");
     ensure_line_after(&mut out, "wrm_nnue2score=", "loss_pow_exp=", "wrm_nnue2score=600.000000000");
     ensure_line_after(&mut out, "wrm_in_offset=", "wrm_nnue2score=", "wrm_in_offset=270.000000000");
     ensure_line_after(&mut out, "wrm_in_scaling=", "wrm_in_offset=", "wrm_in_scaling=340.000000000");
@@ -33245,6 +33296,36 @@ mod tests {
         let disabled =
             Args::try_parse_from(["bulletou", "--teacher", "/dev/null", "--optimizer-weight-clip", "0"]).unwrap();
         assert_eq!(ranger_params(&disabled).max_weight, f32::MAX);
+    }
+
+    #[test]
+    fn bce_cli_json_validation_and_resume() {
+        let mut argv: Vec<std::ffi::OsString> = ["bulletou", "--teacher", "/dev/null", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--superbatches", "1", "--max-epochs", "1", "--wrm-in-offset", "0"].map(Into::into).to_vec();
+        let base = Args::try_parse_from(argv.clone()).unwrap();
+        assert!(!base.loss_bce_with_logits);
+        let old = resume_signature_without_line(&resume_signature(&base), "loss_bce_with_logits=");
+        assert!(resume_signature_matches(&old, &base));
+        bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"), "loss_bce_with_logits", &serde_json::json!(true), &mut argv).unwrap();
+        let mut bce = Args::try_parse_from(argv.clone()).unwrap();
+        assert!(bce.validate_backend_flags().is_ok());
+        assert!(matches!(cuda_cpp_scalar_loss_kind(&bce), bulletou_cuda_cpp::ScalarLossKind::BceWithLogits));
+        assert!(matches!(validation_loss_kind(&bce), ValidationLossKind::BceWithLogits { .. }));
+        assert!((effective_output_inv_scale(&bce) - 600.0 / 340.0).abs() < 1e-6);
+        assert!(!resume_signature_matches(&old, &bce));
+        assert!(value_loss_label(&bce).starts_with("bce-with-logits"));
+        for flag in ["--win-rate-model", "--loss-sigmoid-mse"] {
+            let mut bad = argv.clone();
+            bad.push(flag.into());
+            assert!(Args::try_parse_from(bad).is_err());
+        }
+        bce.wrm_in_offset = 270.0;
+        assert!(bce.validate_backend_flags().unwrap_err().contains("--wrm-in-offset 0"));
+        bce.wrm_in_offset = 0.0;
+        bce.loss_pow_exp = 3.0;
+        assert!(bce.validate_backend_flags().is_err());
+        let q = QuantizedTestArgs::try_parse_from(["quantized-test", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--nn-bin", "nn.bin", "--test-teacher", "test.psv", "--loss-bce-with-logits", "--wrm-in-offset", "0"]).unwrap();
+        assert!(matches!(quantized_train_scale_loss_kind(&q), ValidationLossKind::BceWithLogits { nnue2score: 600.0, .. }));
+        assert!(matches!(quantized_engine_scale_loss_kind(&q), ValidationLossKind::BceWithLogits { nnue2score: 1.0, .. }));
     }
 
     #[test]

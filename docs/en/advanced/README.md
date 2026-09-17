@@ -9,6 +9,7 @@ If you only want to run your first training job, start with the [Tutorial](../tu
 | Page | Topic |
 | --- | --- |
 | [Adjust training settings](tuning.md) | Learning rate, save frequency, validation frequency, and loss |
+| [BCE with Logits](bce-with-logits.md) | Binary cross entropy, formulas, and grid search |
 | [Compare conditions with grid search](grid-search.md) | Sequential Cartesian-product runs and per-epoch acc / loss / qacc / qloss CSV summaries |
 | [Fixed-length trial parameter tuning](parameter-tuning.md) | Short fixed-parameter trials for `lr`, `lr_min`, factorizer, and count confidence |
 | [Automatic population search tuning](auto-tuning.md) | Tuning that continues from accepted checkpoints |

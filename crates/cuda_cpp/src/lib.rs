@@ -2363,6 +2363,7 @@ pub fn sfnn_build_quantized_proxy_device(
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarLossKind {
+    BceWithLogits,
     SigmoidPow { pow_exp: f32 },
     WinRateModel { pow_exp: f32, in_offset_over_scaling: f32 },
 }
@@ -2370,6 +2371,7 @@ pub enum ScalarLossKind {
 impl ScalarLossKind {
     fn as_ffi(self) -> i32 {
         match self {
+            Self::BceWithLogits => 2,
             Self::SigmoidPow { .. } => 0,
             Self::WinRateModel { .. } => 1,
         }
@@ -2377,6 +2379,7 @@ impl ScalarLossKind {
 
     fn loss_pow_exp(self) -> f32 {
         match self {
+            Self::BceWithLogits => 2.0,
             Self::SigmoidPow { pow_exp } => pow_exp,
             Self::WinRateModel { pow_exp, .. } => pow_exp,
         }
@@ -2384,6 +2387,7 @@ impl ScalarLossKind {
 
     fn loss_param(self) -> f32 {
         match self {
+            Self::BceWithLogits => 0.0,
             Self::SigmoidPow { .. } => 0.0,
             Self::WinRateModel { in_offset_over_scaling, .. } => in_offset_over_scaling,
         }
@@ -10703,6 +10707,35 @@ mod tests {
         let out = nnue_forward_host(0, batch, weights).unwrap();
 
         assert_close_slice("nnue", &out, &[1.208, 1.1195], 1.0e-5);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn bce_with_logits_gpu_smoke() {
+        let outputs: [f32; 7] = [-1000.0, -2.0, 0.0, 2.0, 1000.0, 1000.0, -1000.0];
+        let targets = [0.0, 0.2, 0.5, 0.8, 1.0, 0.25, 0.25];
+        let weights = [1.0, 0.5, 2.0, 1.0, 0.0, 1.0, 1.0];
+        let scale = 600.0 / 340.0;
+        let batch = ScalarLossHostBatch { outputs: &outputs, targets: &targets, entry_weights: &weights };
+        let host = scalar_loss_host(0, ScalarLossKind::BceWithLogits, scale, batch).unwrap();
+        let mut expected_sum = 0.0;
+        for i in 0..outputs.len() {
+            let z = outputs[i] * scale;
+            let loss = (if z >= 0.0 { (1.0 - targets[i]) * z } else { -targets[i] * z })
+                + (-z.abs()).exp().ln_1p();
+            let grad = weights[i] * (1.0 / (1.0 + (-z).exp()) - targets[i]) * scale / outputs.len() as f32;
+            assert_close("BCE loss", host.per_sample[i], weights[i] * loss, 1e-4);
+            assert_close("BCE gradient", host.mean_output_gradients[i], grad, 1e-6);
+            expected_sum += weights[i] * loss;
+        }
+        assert_close("BCE mean", host.mean, expected_sum / outputs.len() as f32, 1e-4);
+        let ctx = Context::new(0).unwrap();
+        let device_batch = ScalarLossDeviceBatch::from_host(&ctx, batch).unwrap();
+        let workspace = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(batch.batch_size())).unwrap();
+        scalar_loss_device(&ctx, ScalarLossKind::BceWithLogits, scale, &device_batch, &workspace).unwrap();
+        let device = workspace.download(&ctx).unwrap();
+        assert_close_slice("BCE device loss", &device.per_sample, &host.per_sample, 1e-6);
+        assert_close_slice("BCE device gradient", &device.mean_output_gradients, &host.mean_output_gradients, 1e-6);
     }
 
     #[test]

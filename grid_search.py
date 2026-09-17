@@ -48,7 +48,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
 COMMON_COLUMNS = (
     "arch", "lr", "lr_min", "lr_schedule", "batch_size", "batches_per_update",
     "positions_per_superbatch", "superbatches", "sfnn_factorizer",
-    "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "wrm_nnue2score", "wrm_in_scaling",
+    "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "loss_bce_with_logits", "wrm_nnue2score", "wrm_in_scaling",
     "wrm_target_scaling", "wrm_target_epsilon", "wrm_in_offset", "wrm_target_offset", "loss_pow_exp",
 )
 MANIFEST = "grid-manifest.json"
@@ -174,6 +174,13 @@ def check_settings(settings: dict) -> None:
     for key in ("lr", "lr_min", "wrm_target_scaling", "wrm_in_scaling", "wrm_nnue2score"):
         if key in settings and (type(settings[key]) not in (float, int) or settings[key] <= 0):
             raise ValueError(f"{key} must be positive")
+    if settings.get("loss_bce_with_logits"):
+        if settings.get("loss_sigmoid_mse") or settings.get("win_rate_model"):
+            raise ValueError("loss_bce_with_logits conflicts with loss_sigmoid_mse / win_rate_model")
+        if settings.get("wrm_in_offset", 270) != 0:
+            raise ValueError("loss_bce_with_logits requires wrm_in_offset: 0")
+        if settings.get("loss_pow_exp", 2) != 2:
+            raise ValueError("loss_pow_exp does not apply to BCE; leave it at its default 2")
     if "wrm_target_epsilon" in settings:
         epsilon = settings["wrm_target_epsilon"]
         if type(epsilon) not in (int, float) or not math.isfinite(epsilon) or not 0 <= epsilon < 0.5:
@@ -616,7 +623,7 @@ def main(argv=None) -> int:
     print(f"[CONFIG] relative teacher/input paths use cwd={plan['cwd']}", flush=True)
     objective_keys = {"wrm_target_scaling", "wrm_target_offset", "wrm_target_epsilon", "wrm_in_scaling", "wrm_in_offset",
                       "wrm_nnue2score", "scale", "fv_scale", "loss_pow_exp", "lambda",
-                      "win_rate_model", "loss_sigmoid_mse"}
+                      "win_rate_model", "loss_sigmoid_mse", "loss_bce_with_logits"}
     if any(key in objective_keys and len(values) > 1 for key, values in plan["axes"].items()):
         print("[WARN] this grid varies loss/score conversion settings; raw loss/qloss rankings are not a common-objective comparison", flush=True)
     for trial in plan["trials"]:

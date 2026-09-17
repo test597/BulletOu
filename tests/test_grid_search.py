@@ -43,6 +43,17 @@ class GridSearchTests(unittest.TestCase):
         self.assertTrue(all("elapsed_seconds" not in row for row in rows))
         self.assertEqual(fields[-1], "checkpoint")
 
+    def test_bce_grid_settings_and_columns(self):
+        plan = self.plan(["--grid", "loss_bce_with_logits", "false", "true"])
+        self.assertEqual(len(plan["trials"]), 4)
+        fields, rows = grid.summarize(self.output, plan)
+        self.assertIn("loss_bce_with_logits", fields)
+        self.assertEqual({r["loss_bce_with_logits"] for r in rows}, {False, True})
+        for bad in ({"wrm_in_offset": 270}, {"win_rate_model": True},
+                    {"loss_sigmoid_mse": True}, {"loss_pow_exp": 3}):
+            with self.assertRaises(ValueError):
+                grid.check_settings({**self.common, "loss_bce_with_logits": True, **bad})
+
     def test_target_epsilon_grid_and_summary(self):
         plan = self.plan(["--wrm-target-epsilons", "0", "0.005", "0.01"])
         self.complete_plan(plan)

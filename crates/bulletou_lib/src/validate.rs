@@ -131,6 +131,8 @@ impl ValidationSampleMask {
 /// Loss formula used for `test_value_loss`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValidationLossKind {
+    /// Stable BCE on z = model_output * nnue2score / in_scaling.
+    BceWithLogits { nnue2score: f32, in_scaling: f32, target: WinRateModelTargetParams },
     /// Sigmoid probability-space value loss:
     /// `abs(sigmoid(model_output / model_output_scale) - target)^pow_exp`, where
     /// `pow_exp=2` is MSE,
@@ -139,6 +141,11 @@ pub enum ValidationLossKind {
     SigmoidPow { pow_exp: f32 },
     /// Win-rate-model value loss with shogi WRM transforms.
     WinRateModel { pow_exp: f32, nnue2score: f32, in_offset: f32, in_scaling: f32, target: WinRateModelTargetParams },
+}
+
+/// Numerically stable BCE for soft targets and extreme finite logits.
+pub fn bce_with_logits(z: f32, target: f32) -> f32 {
+    (if z >= 0.0 { (1.0 - target) * z } else { -target * z }) + (-z.abs()).exp().ln_1p()
 }
 
 #[inline]
@@ -318,17 +325,19 @@ pub fn compute_sign_accuracy_with_loss(
             };
             let score_norm = match loss_kind {
                 ValidationLossKind::SigmoidPow { .. } => sigmoid(inv_scale * f32::from(s)),
-                ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
+                ValidationLossKind::WinRateModel { target, .. } | ValidationLossKind::BceWithLogits { target, .. } => target.probability(f32::from(s)),
             };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
                 ValidationLossKind::SigmoidPow { .. } => sigmoid(*m * model_inv_scale),
+                ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => sigmoid(*m * nnue2score / in_scaling),
                 ValidationLossKind::WinRateModel { nnue2score, in_offset, in_scaling, .. } => {
                     wrm_probability(*m * nnue2score, in_offset, in_scaling)
                 }
             };
             let diff = model_p - target;
             loss_sum += match loss_kind {
+                ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => bce_with_logits(*m * nnue2score / in_scaling, target),
                 ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
                 ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
@@ -425,17 +434,19 @@ pub fn compute_sign_accuracy_with_loss_masked(
             };
             let score_norm = match loss_kind {
                 ValidationLossKind::SigmoidPow { .. } => sigmoid(inv_scale * f32::from(s)),
-                ValidationLossKind::WinRateModel { target, .. } => target.probability(f32::from(s)),
+                ValidationLossKind::WinRateModel { target, .. } | ValidationLossKind::BceWithLogits { target, .. } => target.probability(f32::from(s)),
             };
             let target = blend * result_norm + (1.0 - blend) * score_norm;
             let model_p = match loss_kind {
                 ValidationLossKind::SigmoidPow { .. } => sigmoid(m * model_inv_scale),
+                ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => sigmoid(m * nnue2score / in_scaling),
                 ValidationLossKind::WinRateModel { nnue2score, in_offset, in_scaling, .. } => {
                     wrm_probability(m * nnue2score, in_offset, in_scaling)
                 }
             };
             let diff = model_p - target;
             loss_sum += match loss_kind {
+                ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => bce_with_logits(m * nnue2score / in_scaling, target),
                 ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
                 ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
             };
@@ -745,6 +756,37 @@ impl SeededXorShift {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bce_logits_extremes_and_soft_targets() {
+        assert!((bce_with_logits(0.0, 0.3) - 2.0f32.ln()).abs() < 1e-7);
+        assert_eq!(bce_with_logits(1000.0, 1.0), 0.0);
+        assert_eq!(bce_with_logits(-1000.0, 0.0), 0.0);
+        assert_eq!(bce_with_logits(1000.0, 0.25), 750.0);
+        assert_eq!(bce_with_logits(-1000.0, 0.25), 250.0);
+        for z in [-8.0, -1.0, 0.0, 1.0, 8.0] {
+            let h = 0.001;
+            let numeric = (bce_with_logits(z + h, 0.3) - bce_with_logits(z - h, 0.3)) / (2.0 * h);
+            assert!((numeric - (sigmoid(z) - 0.3)).abs() < 0.0005);
+        }
+    }
+
+    #[test]
+    fn bce_validation_matches_teacher_transform_and_blend() {
+        let target = WinRateModelTargetParams { offset: 135.0, scaling: 380.0, epsilon: 0.05 };
+        let outputs = [-1.0, 0.0, 1.0];
+        let scores = [-300, 100, 500];
+        let results = [-1, 0, 1];
+        let kind = ValidationLossKind::BceWithLogits { nnue2score: 600.0, in_scaling: 340.0, target };
+        let report = compute_sign_accuracy_with_loss(&outputs, &scores, &results, None, 0.7, 600.0, 1.0, kind);
+        let expected: f32 = outputs.iter().enumerate().map(|(i, &m)| {
+            let t = 0.7 * target.probability(scores[i] as f32) + 0.3 * (results[i] as f32 + 1.0) * 0.5;
+            bce_with_logits(m * 600.0 / 340.0, t)
+        }).sum::<f32>() / 3.0;
+        assert!((report.test_loss.unwrap() - expected).abs() < 1e-6);
+        assert_eq!(report.sign_matches, 2);
+        assert_eq!(report.loss_sampled, 3);
+    }
 
     #[test]
     fn accuracy_all_match() {

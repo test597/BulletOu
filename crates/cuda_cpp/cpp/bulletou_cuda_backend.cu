@@ -2049,6 +2049,19 @@ __device__ float sign_f32(float value) {
     return 0.0f;
 }
 
+__global__ void loss_bce_with_logits_reduce_kernel(
+    const float* outputs, const float* targets, const float* entry_weights,
+    float* per_sample, float* mean_output_gradients, float output_inv_scale, size_t batch) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch) return;
+    float z = outputs[idx] * output_inv_scale;
+    float t = targets[idx];
+    float loss = (z >= 0.0f ? (1.0f - t) * z : -t * z) + log1pf(expf(-fabsf(z)));
+    per_sample[idx] = entry_weights[idx] * loss;
+    mean_output_gradients[idx] = entry_weights[idx] * (loss_sigmoid(z) - t)
+        * output_inv_scale / static_cast<float>(batch);
+}
+
 __global__ void loss_sigmoid_pow_reduce_kernel(
     const float* outputs,
     const float* targets,
@@ -6660,8 +6673,8 @@ int validate_scalar_loss(size_t batch, int kind, float loss_pow_exp, float loss_
     if (batch == 0) {
         return fail_message("scalar loss batch size must be greater than zero");
     }
-    if (kind != 0 && kind != 1) {
-        return fail_message("scalar loss kind must be 0 (sigmoid-pow) or 1 (win-rate-model)");
+    if (kind != 0 && kind != 1 && kind != 2) {
+        return fail_message("scalar loss kind must be 0 (sigmoid-pow), 1 (win-rate-model), or 2 (BCE with logits)");
     }
     if (!(std::isfinite(loss_pow_exp) && loss_pow_exp >= 1.0f)) {
         return fail_message("loss_pow_exp must be finite and >= 1");
@@ -6700,7 +6713,11 @@ int launch_scalar_loss_kernels(
         return -1;
     }
 
-    if (kind == 0) {
+    if (kind == 2) {
+        loss_bce_with_logits_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            outputs, targets, entry_weights, per_sample, mean_output_gradients, output_inv_scale, batch);
+        if (check_kernel_launch("loss_bce_with_logits_reduce_kernel launch") != 0) return -1;
+    } else if (kind == 0) {
         loss_sigmoid_pow_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
             outputs,
             targets,
