@@ -1,5 +1,7 @@
 # Grid searchで学習条件を比較する
 
+`grid_summary.csv` はtrial開始時・終了時・中断時に加え、**学習中もepoch完了ごとに更新**します。本体の `summary-learn.csv` を約1秒間隔で確認するため、stdoutの次の出力やtrial全体の終了を待ちません。10epochのtrialなら、1epoch完了時点からその結果を確認できます。未完了epochの測定値は空欄のままです（`--epochs` で掲載epochを限定した場合はその指定に従います）。書き込み途中の元CSVや、一時的な出力ファイルのロックは警告して再試行し、学習は停止しません。
+
 BCEとの比較は `--grid loss_bce_with_logits false true` で指定できます。共通設定の `wrm_in_offset` は0にし、明示的な `win_rate_model` / `loss_sigmoid_mse` は無効にしてください。[BCEの計算式・注意点](bce-with-logits.md)を参照してください。
 
 SFNNのノルム正則化も `--grid sfnn_norm_loss_strength 0 0.000001 0.00001 0.0001` で比較できます。[Norm lossの対象・計算式・実行例](norm-loss.md)を参照してください。

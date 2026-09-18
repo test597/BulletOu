@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -42,6 +43,66 @@ class GridSearchTests(unittest.TestCase):
         self.assertNotIn("elapsed_seconds", fields)
         self.assertTrue(all("elapsed_seconds" not in row for row in rows))
         self.assertEqual(fields[-1], "checkpoint")
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("timed out waiting for live epoch summary")
+
+    def csv_rows(self, path):
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f))
+
+    def test_grid_updates_finished_epoch_before_child_exits(self):
+        def child(command, directory, cwd, trial_id):
+            self.summary(directory, [self.metrics(epoch=1), self.metrics(epoch=2, sb=1)])
+            path = self.output / "grid_summary.csv"
+            def published():
+                rows = [r for r in self.csv_rows(path) if r["trial"] == str(trial_id)]
+                return rows[0]["test_value_accuracy"] == "0.63"
+            self.wait_until(published)
+            rows = [r for r in self.csv_rows(path) if r["trial"] == str(trial_id)]
+            self.assertEqual(rows[0]["status"], "done")
+            self.assertEqual(rows[0]["trial_status"], "running")
+            for row in rows[1:]:
+                for metric in grid.METRICS:
+                    self.assertEqual(row[metric], "")
+            self.summary(directory, [self.metrics(epoch=e) for e in range(1, 11)])
+            return 0, 1.0
+        code, _ = self.run_grid(["--epochs", *map(str, range(1, 11))], child)
+        self.assertEqual(code, 0)
+
+    def test_live_summary_retries_partial_rows_and_locked_output(self):
+        plan = self.plan()
+        trial = plan["trials"][0]
+        directory = grid.trial_dir(self.output, trial)
+        self.summary(directory, [self.metrics(epoch=1)])
+        log = directory / grid.SUMMARY_CSV_NAME
+        complete = log.read_bytes()
+        self.summary(directory, [])
+        path = self.output / "grid_summary.csv"
+        grid.write_summary(self.output, plan, path)
+        original = path.read_bytes()
+        with redirect_stdout(io.StringIO()):
+            with grid.live_summary_updates(self.output, plan, path, trial, interval=0.01):
+                # Valid CSV prefix, but not yet a completely appended record.
+                log.write_bytes(complete.rstrip(b"\r\n"))
+                with self.assertRaises(ValueError):
+                    grid.log_rows(directory, live=True)
+                time.sleep(0.05)
+                self.assertEqual(path.read_bytes(), original)
+                with patch.object(grid, "write_summary", side_effect=PermissionError("locked")) as blocked:
+                    log.write_bytes(complete)
+                    self.wait_until(lambda: blocked.call_count > 0)
+                    self.assertEqual(path.read_bytes(), original)
+                self.wait_until(lambda: self.csv_rows(path)[0]["status"] == "done")
+                self.summary(directory, [self.metrics(epoch=1), self.metrics(epoch=2)])
+                self.wait_until(lambda: self.csv_rows(path)[1]["status"] == "done")
+        # No monitor remains to race the final writer after leaving the context.
+        self.assertEqual(self.csv_rows(path)[0]["test_value_accuracy"], "0.63")
 
     def test_bce_grid_settings_and_columns(self):
         plan = self.plan(["--grid", "loss_bce_with_logits", "false", "true"])

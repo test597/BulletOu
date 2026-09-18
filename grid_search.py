@@ -13,12 +13,14 @@ import copy
 import csv
 import hashlib
 import itertools
+import io
 import json
 import math
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -287,11 +289,16 @@ def trial_dir(root: Path, trial: dict) -> Path:
     return root / "trials" / name
 
 
-def log_rows(directory: Path) -> list[dict]:
+def log_rows(directory: Path, *, live=False) -> list[dict]:
     path = directory / SUMMARY_CSV_NAME
     if not path.is_file():
         return []
-    with path.open(encoding="utf-8-sig", newline="") as f:
+    # Live readers must not accept a partially appended final record, even if
+    # that prefix happens to be syntactically valid CSV.
+    text = path.read_text(encoding="utf-8-sig")
+    if live and text and not text.endswith("\n"):
+        raise ValueError(f"{path}: waiting for a complete CSV record")
+    with io.StringIO(text, newline="") as f:
         reader = csv.DictReader(f, strict=True)
         if not {"epoch", "superbatch"}.issubset(reader.fieldnames or []):
             raise ValueError(f"{path}: expected ordinary BulletOu epoch/superbatch CSV")
@@ -323,8 +330,9 @@ def checkpoint_path(directory: Path, row: dict) -> str:
     return str(path) if state.is_file() and state.stat().st_size > 0 else ""
 
 
-def is_complete(directory: Path, trial: dict, state: dict) -> bool:
-    rows = log_rows(directory)
+def is_complete(directory: Path, trial: dict, state: dict, rows=None) -> bool:
+    if rows is None:
+        rows = log_rows(directory)
     target = (trial["settings"]["max_epochs"], trial["settings"]["superbatches"])
     last = next((r for r in reversed(rows) if (int(r["epoch"]), int(r["superbatch"])) == target), None)
     # A saved final row can recover completion after a runner interruption just
@@ -467,7 +475,7 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
     return merged, selected
 
 
-def summarize(root: Path, plan: dict, epochs=None) -> tuple[list[str], list[dict]]:
+def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[list[str], list[dict]]:
     parameter_columns = list(dict.fromkeys([*plan["axes"], *COMMON_COLUMNS]))
     parameter_columns = [key for key in parameter_columns
                          if any(key in t["settings"] for t in plan["trials"])]
@@ -482,11 +490,11 @@ def summarize(root: Path, plan: dict, epochs=None) -> tuple[list[str], list[dict
         state_path = directory / "grid-state.json"
         state = read_json(state_path) if state_path.is_file() else {}
         trial_status = state.get("status", "pending")
-        if is_complete(directory, trial, state):
+        rows = trial_rows[trial["id"]] if trial_rows is not None and trial["id"] in trial_rows else log_rows(directory)
+        if is_complete(directory, trial, state, rows):
             trial_status = "done"
         elif trial_status == "done":
             trial_status = "incomplete"
-        rows = log_rows(directory)
         for epoch in epochs or plan["report_epochs"]:
             if epoch > trial["settings"]["max_epochs"]:
                 continue  # Unselected conditions were not extended.
@@ -518,8 +526,8 @@ def summarize(root: Path, plan: dict, epochs=None) -> tuple[list[str], list[dict
     return fields, result
 
 
-def write_summary(root: Path, plan: dict, path: Path, epochs=None) -> list[dict]:
-    fields, rows = summarize(root, plan, epochs)
+def write_summary(root: Path, plan: dict, path: Path, epochs=None, *, trial_rows=None) -> list[dict]:
+    fields, rows = summarize(root, plan, epochs, trial_rows=trial_rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
     with temp.open("w", encoding="utf-8-sig", newline="") as f:
@@ -528,6 +536,50 @@ def write_summary(root: Path, plan: dict, path: Path, epochs=None) -> list[dict]
         writer.writerows(rows)
     temp.replace(path)
     return rows
+
+
+@contextmanager
+def live_summary_updates(root: Path, plan: dict, path: Path, trial: dict, *, interval=1.0):
+    """Publish completed epochs while the child is alive, even if stdout is quiet.
+
+    Stop/join before the main thread updates state or writes its final summary.
+    CSV read/write failures are retried, never used to terminate training.
+    """
+    stop = threading.Event()
+    directory = trial_dir(root, trial)
+
+    def closed_rows(rows):
+        return [r for r in rows if int(r["superbatch"]) == trial["settings"]["superbatches"]]
+
+    previous = closed_rows(log_rows(directory))
+
+    def watch():
+        nonlocal previous
+        warned = None
+        while not stop.wait(interval):
+            try:
+                rows = log_rows(directory, live=True)
+                closed = closed_rows(rows)
+                if not closed or closed == previous:
+                    continue
+                # Use the same complete snapshot for detection and aggregation.
+                write_summary(root, plan, path, trial_rows={trial["id"]: rows})
+                previous = closed
+                warned = None
+                print(f"[SUMMARY] trial={trial['id']} completed_epoch={closed[-1]['epoch']} updated: {path}", flush=True)
+            except (OSError, ValueError, csv.Error) as exc:
+                message = str(exc)
+                if message != warned:
+                    print(f"[WARN] live summary update deferred; will retry: {message}", flush=True)
+                    warned = message
+
+    thread = threading.Thread(target=watch, name="grid-epoch-summary", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
 
 
 def print_leaders(rows: list[dict]) -> None:
@@ -681,7 +733,8 @@ def main(argv=None) -> int:
             print("[COMMAND] " + subprocess.list2cmdline(command), flush=True)
             started = time.monotonic()
             try:
-                code, elapsed = run_child(command, directory, plan["cwd"], trial["id"])
+                with live_summary_updates(root, plan, summary_path, trial):
+                    code, elapsed = run_child(command, directory, plan["cwd"], trial["id"])
                 rows = log_rows(directory)
                 last = rows[-1] if rows else {}
                 reached_end = (last.get("epoch") == str(trial["settings"]["max_epochs"])
