@@ -153,7 +153,15 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 
 以前のtrialフォルダは丸ごと `<grid root>/interrupted-runs/<trial名>-<日時>-<識別子>/` に退避し、元のtrial番号・保存先で再実行します。途中ログや不完全な保存ファイルも消さずに残し、新しい学習の集計には混ぜません。stdoutに `[RESTART]` と `[ARCHIVE]` を表示します。完了済み条件・選択していない条件は再実行しません。手動でフォルダを削除したり、新しいgrid rootを作る必要はありません。
 
-通常の再実行ではmanifestと異なる計画を拒否します。ただし `--resume` では、既存gridの一部の条件だけを選び、最大epoch数を増やして延長できます。LR・教師・batch size等、epoch数以外の学習条件は変更できません。実行ファイルは同じpathで再ビルドして構いませんが、実装変更前後の比較には注意してください。データ・開始state・progress.bin・count.bin等の入力ファイルも内容を固定してください。
+通常の再実行ではmanifestと異なる計画を拒否します。ただし `--resume` では、同じgrid条件のcheckpointを引き継ぎつつ、共通JSONのLR・batch size・bpu・保存／検証頻度などを変更できます。stdoutの `[SETTINGS CHANGED]` に変更前後を表示します。実行中のJSON変更を自動反映する機能ではなく、次の起動から反映します。
+
+条件の識別には明示的なgrid引数を使います。例えば `--lrs 0.0001 0.0002` を指定していれば、JSONの `lr` よりその値を優先します。gridの値を変更した条件には、別条件のcheckpointを流用せず、新規trialを作ります。`arch`・`backend`・`no_ft_factorize` の変更は既存checkpointとの互換性のため拒否します。それ以外もBulletOu本体の読み込み・引数検証は行われます。
+
+完了済みtrialは設定変更だけでは再実行しません。延長するには `max_epochs` を増やしてください。共通設定を途中変更した結果は、最初から同一条件で学習した結果とは区別して比較してください。実行ファイルは同じpathで再ビルドできますが、入力ファイルの内容変更や実装変更も比較に影響します。
+
+各trialの `grid-settings-history.json` に起動ごとの設定・時刻・起動前ログの最終epoch/sbを記録します。このログ位置は実際の再開checkpoint位置ではありません。元の `bulletou-settings.json` は保持し、実行設定は `bulletou-resume-settings.json`（checkpoint再開）または `bulletou-run-settings.json`（新規実行）へ書きます。共通JSONには書き戻しません。
+
+変更前の完了epochには当時の設定をmanifestに記録し、`grid_summary.csv` のLR・bpu・sb数などを新設定で上書きしません。途中epochで設定を変更した場合は、完了時の設定をそのepochの行に表示します。epoch全体がその設定だったことを意味しないため、途中変更の詳細は起動履歴を確認してください。checkpointがなく再実行する場合は、新しい要求設定の初期stateから開始し、古い結果は退避します。
 
 ### 完了した条件を延長する
 
@@ -172,7 +180,7 @@ python .\grid_search.py `
 
 - `--epochs 10` は「追加10epoch」ではなく、通算の終了epochです。`--epochs 1 2 3 4 5 6 7 8 9 10` と列挙しても構いません。
 - 通常のgrid引数に書いた条件だけ実行します。専用のtrial選択オプションはありません。元のgrid軸名はすべて指定してください。値のリストは絞ることも追加することもできます。`--resume` で未登録の条件を指定すると、既存の最大trial番号に続けて新規登録します。既存の番号・保存先・結果は保持し、新条件は共通の初期state・教師位置から学習します。完了済みの既存条件はスキップします。
-- 例：最初に `--grid wrm_target_offset 135 270 540 0` を実行した同じoutput-folderで、`--grid wrm_target_offset 70 35 100 135 170 200 235 270 540 0 --resume` とすれば、新しい6条件を追加できます。指定しなかった既存条件もmanifestと集計に残り、新条件の完了後は同じ `grid_summary.csv` で比較できます。grid軸以外の共通学習設定の変更は拒否します。`--dry-run` なら追加計画だけ確認でき、ファイルも学習も変更しません。
+- 例：最初に `--grid wrm_target_offset 135 270 540 0` を実行した同じoutput-folderで、`--grid wrm_target_offset 70 35 100 135 170 200 235 270 540 0 --resume` とすれば、新しい6条件を追加できます。指定しなかった既存条件もmanifestと集計に残り、新条件の完了後は同じ `grid_summary.csv` で比較できます。共通JSONの変更は選択した条件に適用します。`--dry-run` なら追加・変更計画だけ確認でき、ファイルも学習も変更しません。
 - 600／1200それぞれの保存済みcheckpointから、本体の `--resume` で重み・optimizer・教師位置を継続します。完了した5epoch目の保存があればepoch 6から再開します。中断中なら最後の保存点から再開し、未保存分は巻き戻ります。
 - trial番号・フォルダ名は変えません。名前末尾のhashも作成時のものを維持します。
 - 元の `bulletou-settings.json` は保持し、延長後の設定は `bulletou-resume-settings.json` とmanifestに記録します。共通JSONへの書き戻しはしません。

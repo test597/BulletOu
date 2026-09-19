@@ -47,8 +47,11 @@ class GridSearchTests(unittest.TestCase):
     def wait_until(self, predicate):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            if predicate():
-                return
+            try:
+                if predicate():
+                    return
+            except PermissionError:
+                pass  # Windows may briefly deny reads during atomic replacement.
             time.sleep(0.01)
         self.fail("timed out waiting for live epoch summary")
 
@@ -399,7 +402,7 @@ class GridSearchTests(unittest.TestCase):
         before = (self.output / grid.MANIFEST).read_bytes()
         grid.atomic_json(self.settings_path, {**self.common, "wrm_in_offset": 10})
         with self.assertRaisesRegex(ValueError, "manifest differs"):
-            self.run_grid(["--resume"])
+            self.run_grid()
         self.assertEqual((self.output / grid.MANIFEST).read_bytes(), before)
 
     def test_interrupt_resume_uses_own_state_not_common_initial(self):
@@ -626,12 +629,12 @@ class GridSearchTests(unittest.TestCase):
     def test_resume_error_lists_changes_without_writing(self):
         argv, old = self.saved_scale_grid()
         before = (self.output / grid.MANIFEST).read_bytes()
-        grid.atomic_json(self.settings_path, {**self.common, "batches_per_update": 4, "lr": 0.0003})
+        grid.atomic_json(self.settings_path, {**self.common, "arch": "SFNN_halfka2_256_8_32"})
         with self.assertRaises(ValueError) as error:
             grid.main([*argv, "--resume", "--epochs", "3"])
         message = str(error.exception)
-        self.assertIn("batches_per_update: saved=<not specified>, requested=4", message)
-        self.assertIn("lr: saved=0.001, requested=0.0003", message)
+        self.assertIn("checkpoint-incompatible settings changed: arch", message)
+        self.assertIn('requested="SFNN_halfka2_256_8_32"', message)
         self.assertNotIn("max_epochs: saved=", message)
         self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())
         self.assertEqual(grid.settings_diff({"batches_per_update": 1}, {"batches_per_update": 4}),
@@ -644,16 +647,107 @@ class GridSearchTests(unittest.TestCase):
         for arguments in ([*argv, "--resume", "--epochs", "1"],):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 grid.main(arguments)
-        grid.atomic_json(self.settings_path, {**self.common, "lr": 0.0003})
-        with self.assertRaisesRegex(ValueError, "training settings changed"):
+        grid.atomic_json(self.settings_path, {**self.common, "no_ft_factorize": True})
+        with self.assertRaisesRegex(ValueError, "checkpoint-incompatible"):
             grid.main([*argv, "--resume", "--epochs", "7"])
-        with self.assertRaisesRegex(ValueError, "training settings changed outside grid axes"):
-            grid.main([*argv[:-3], "2400", "--resume"])
         self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())
+
+    def test_resume_common_changes_preserve_historical_epochs_and_original_launch(self):
+        argv, old = self.saved_scale_grid()
+        directory = grid.trial_dir(self.output, old["trials"][0])
+        original = (directory / "bulletou-settings.json").read_bytes()
+        grid.atomic_json(self.settings_path, {
+            **self.common, "lr": 0.0003, "batches_per_update": 4,
+            "superbatches": 8, "save_rate": 0, "validation_rate": 1, "max_epochs": 3,
+        })
+        requested = [*argv[:-3], "600", "--resume"]
+        seen = []
+        def child(command, path, cwd, trial_id):
+            self.assertEqual(trial_id, 1)
+            self.assertIn("--resume", command)
+            settings = grid.read_json(Path(command[2]))
+            self.assertEqual(settings["lr"], 0.0003)
+            self.assertEqual(settings["batches_per_update"], 4)
+            self.assertEqual(settings["superbatches"], 8)
+            self.assertEqual(settings["wrm_target_scaling"], 600)
+            self.summary(path, [*grid.log_rows(path), self.metrics(epoch=3, sb=8)])
+            seen.append(trial_id)
+            return 0, 1
+        with patch.object(grid, "preflight_exe"), patch.object(grid, "run_child", side_effect=child), redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(grid.main(requested), 0)
+            self.assertEqual(grid.main(requested), 0)
+        self.assertEqual(seen, [1])
+        self.assertIn("[SETTINGS CHANGED]", out.getvalue())
+        self.assertEqual((directory / "bulletou-settings.json").read_bytes(), original)
+        rows = [r for r in self.csv_rows(self.output / "grid_summary.csv") if r["trial"] == "1"]
+        self.assertEqual([r["lr"] for r in rows], ["0.001", "0.001", "0.0003"])
+        self.assertEqual([r["superbatches"] for r in rows], ["4", "4", "8"])
+        self.assertEqual([r["batches_per_update"] for r in rows], ["", "", "4"])
+        self.assertTrue(all(r["status"] == "done" for r in rows))
+        history = grid.read_json(directory / "grid-settings-history.json")["launches"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["settings"]["lr"], 0.0003)
+        self.assertEqual(history[0]["log_last_point_before_launch"], {"epoch": 2, "superbatch": 4})
+
+    def test_new_grid_condition_uses_new_common_settings_without_altering_old_results(self):
+        argv, old = self.saved_scale_grid()
+        grid.atomic_json(self.settings_path, {**self.common, "lr": 0.0003})
+        req = grid.make_plan(grid.parse_args([*argv[:-3], "2400", "--resume"]))
+        merged, selected = grid.plan_resume(self.output, old, req)
+        self.assertEqual(selected, {4})
+        self.assertEqual(merged["trials"][0]["settings"]["lr"], 0.0003)
+        self.assertEqual(merged["trials"][1:], old["trials"])
+
+    def test_common_changes_without_checkpoint_restart_with_new_launch_settings(self):
+        def interrupted(command, directory, cwd, trial_id):
+            self.summary(directory, [self.metrics(sb=2)])
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_grid(child=interrupted)
+        grid.atomic_json(self.settings_path, {**self.common, "batches_per_update": 4})
+        def restarted(command, directory, cwd, trial_id):
+            self.assertNotIn("--resume", command)
+            settings = grid.read_json(Path(command[2]))
+            self.assertEqual(settings["batches_per_update"], 4)
+            self.assertEqual(grid.log_rows(directory), [])
+            return self.fake_run(command, directory, cwd, trial_id)
+        code, calls = self.run_grid(["--resume"], restarted)
+        self.assertEqual((code, calls.call_count), (0, 2))
+        plan = grid.read_json(self.output / grid.MANIFEST)
+        self.assertEqual(plan["trials"][0]["initial_settings"]["batches_per_update"], 4)
+        self.assertNotIn("epoch_settings", plan["trials"][0])
+        archives = list((self.output / "interrupted-runs").iterdir())
+        self.assertEqual(len(archives), 1)
+        self.assertNotIn("batches_per_update", grid.read_json(archives[0] / "bulletou-settings.json"))
+
+    def test_grid_axis_overrides_json_and_retains_trial_identity(self):
+        self.run_grid()
+        old = grid.read_json(self.output / grid.MANIFEST)
+        grid.atomic_json(self.settings_path, {**self.common, "lr": 0.02, "validation_rate": 1})
+        req = self.plan(["--resume"])
+        merged, selected = grid.plan_resume(self.output, old, req)
+        self.assertEqual([t["settings"]["lr"] for t in merged["trials"]], [0.0001, 0.0002])
+        self.assertEqual([t["name"] for t in merged["trials"]], [t["name"] for t in old["trials"]])
+        self.assertEqual(selected, {1, 2})
+
+    def test_rollback_recomputed_epoch_does_not_reuse_old_settings(self):
+        argv, old = self.saved_scale_grid()
+        grid.atomic_json(self.settings_path, {**self.common, "lr": 0.0003})
+        req = grid.make_plan(grid.parse_args([*argv, "--resume", "--epochs", "3"]))
+        merged, _ = grid.plan_resume(self.output, old, req)
+        trial = merged["trials"][0]
+        directory = grid.trial_dir(self.output, trial)
+        rows = grid.log_rows(directory)
+        rows[-1]["test_value_loss"] = "0.11"
+        self.summary(directory, rows)
+        result = [r for r in grid.summarize(self.output, merged)[1] if r["trial"] == 1]
+        self.assertEqual(result[0]["lr"], 0.001)
+        self.assertEqual(result[1]["lr"], 0.0003)
 
     def test_extension_dry_run_and_lock_failure_do_not_write(self):
         argv, old = self.saved_scale_grid()
         before = (self.output / grid.MANIFEST).read_bytes()
+        grid.atomic_json(self.settings_path, {**self.common, "lr": 0.0003, "batches_per_update": 4})
         with patch.object(grid,"preflight_exe"), patch.object(grid,"run_child") as child, redirect_stdout(io.StringIO()):
             self.assertEqual(grid.main([*argv,"--resume","--epochs","7","--dry-run"]),0)
             with grid.grid_lock(self.output):

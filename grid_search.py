@@ -333,7 +333,9 @@ def checkpoint_path(directory: Path, row: dict) -> str:
 def is_complete(directory: Path, trial: dict, state: dict, rows=None) -> bool:
     if rows is None:
         rows = log_rows(directory)
-    target = (trial["settings"]["max_epochs"], trial["settings"]["superbatches"])
+    epoch = trial["settings"]["max_epochs"]
+    group = [r for r in rows if int(r["epoch"]) == epoch]
+    target = (epoch, epoch_settings(trial, epoch, group)["superbatches"])
     last = next((r for r in reversed(rows) if (int(r["epoch"]), int(r["superbatch"])) == target), None)
     # A saved final row can recover completion after a runner interruption just
     # after the child finished, before grid-state.json was updated.
@@ -377,6 +379,8 @@ def restart_unsaved_trials(root: Path, plan: dict, selected: set[int]) -> None:
         archive.parent.mkdir(parents=True, exist_ok=True)
         directory.rename(archive)
         directory.mkdir()
+        trial["initial_settings"] = copy.deepcopy(trial["settings"])
+        trial.pop("epoch_settings", None)
         atomic_json(directory / "grid-state.json", {
             "status": "pending", "elapsed_seconds": state.get("elapsed_seconds", 0),
             "restarted_from_archive": str(archive),
@@ -386,12 +390,12 @@ def restart_unsaved_trials(root: Path, plan: dict, selected: set[int]) -> None:
 
 
 def training_identity(settings: dict) -> dict:
-    """Epoch budget may increase; all actual training conditions must match."""
+    """Compare launch files while allowing the historical epoch budget."""
     return {k: v for k, v in settings.items() if k not in {"output", "tag", "max_epochs"}}
 
 
 def settings_diff(saved: dict, requested: dict) -> str:
-    """Diagnostic only: retain the existing comparison/acceptance rules."""
+    """Show all changed, added and removed settings."""
     def value(settings, key):
         return json.dumps(settings[key], ensure_ascii=False) if key in settings else "<not specified>"
     return "\n".join(
@@ -406,13 +410,41 @@ def check_trial_settings_file(directory: Path, trial: dict) -> None:
     if not path.exists():
         return
     saved = read_json(path)
-    expected = trial["settings"]
+    expected = trial.get("initial_settings", trial["settings"])
     # Keep the original launch file immutable; extensions use resume-settings.
     if (training_identity(saved) != training_identity(expected)
             or saved.get("output") != expected.get("output") or saved.get("tag") != expected.get("tag")
             or type(saved.get("max_epochs")) is not int
             or not 1 <= saved["max_epochs"] <= expected["max_epochs"]):
         raise ValueError(f"trial settings were edited: {path}; refusing to overwrite")
+
+
+def rows_digest(rows: list[dict]) -> str:
+    return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+
+
+def epoch_settings(trial: dict, epoch: int, rows: list[dict]) -> dict:
+    saved = trial.get("epoch_settings", {}).get(str(epoch))
+    # A rollback/retraining changes the log: never label new results with old settings.
+    if saved is not None and saved["rows_digest"] == rows_digest(rows):
+        return saved["settings"]
+    return trial["settings"]
+
+
+def remember_completed_epoch_settings(directory: Path, trial: dict) -> None:
+    try:
+        rows = log_rows(directory)
+    except (ValueError, csv.Error):
+        if has_resume_checkpoint(directory):
+            raise
+        return  # The unsaved attempt will be archived and restarted.
+    for epoch in sorted({int(r["epoch"]) for r in rows}):
+        group = [r for r in rows if int(r["epoch"]) == epoch]
+        settings = epoch_settings(trial, epoch, group)
+        if int(group[-1]["superbatch"]) == settings["superbatches"]:
+            trial.setdefault("epoch_settings", {})[str(epoch)] = {
+                "rows_digest": rows_digest(group), "settings": copy.deepcopy(settings),
+            }
 
 
 def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[int]]:
@@ -426,16 +458,6 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
     for candidate in requested["trials"]:
         matches = [t for t in merged["trials"] if t["parameters"] == candidate["parameters"]]
         if not matches:
-            axes = set(stored["axes"])
-            common = lambda s: {k: v for k, v in training_identity(s).items() if k not in axes}
-            for existing in stored["trials"]:
-                if common(existing["settings"]) != common(candidate["settings"]):
-                    raise ValueError(
-                        "existing grid manifest differs: new condition training settings changed outside grid axes"
-                        f" (compared with trial {existing['id']})\n"
-                        + settings_diff(common(existing["settings"]), common(candidate["settings"]))
-                        + "\nRestore the saved common settings or use a different --output-folder. Nothing was overwritten."
-                    )
             trial = copy.deepcopy(candidate)
             trial["id"] = max(t["id"] for t in merged["trials"]) + 1
             trial["name"] = f"trial{trial['id']:04}-" + candidate["name"].split("-", 1)[1]
@@ -453,19 +475,26 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
             raise ValueError(f"existing grid manifest differs: no unique existing condition for {candidate['parameters']}")
         trial = matches[0]
         old, new = trial["settings"]["max_epochs"], candidate["settings"]["max_epochs"]
-        if training_identity(trial["settings"]) != training_identity(candidate["settings"]):
+        defaults = {"backend": "cuda-cpp", "no_ft_factorize": False}
+        incompatible = [k for k in ("arch", "backend", "no_ft_factorize")
+                        if trial["settings"].get(k, defaults.get(k)) != candidate["settings"].get(k, defaults.get(k))]
+        if incompatible:
             raise ValueError(
-                f"existing grid manifest differs: trial {trial['id']} training settings changed; only max_epochs may increase\n"
-                + settings_diff(training_identity(trial["settings"]), training_identity(candidate["settings"]))
-                + "\nRestore the saved values to resume this trial, or use a different --output-folder for changed settings. Nothing was overwritten."
-            )
+                f"trial {trial['id']}: checkpoint-incompatible settings changed: {', '.join(incompatible)}\n"
+                + settings_diff({k: trial["settings"].get(k, defaults.get(k)) for k in incompatible},
+                                {k: candidate["settings"].get(k, defaults.get(k)) for k in incompatible})
+                + "\nUse a new grid root for a different network layout. Nothing was overwritten.")
         if new < old:
             raise ValueError(f"cannot reduce trial {trial['id']} max_epochs from {old} to {new}; use --epochs {old} or higher")
         directory = trial_dir(root, trial)
         check_trial_settings_file(directory, trial)
+        updated = {**candidate["settings"], "output": trial["settings"]["output"], "tag": trial["settings"]["tag"]}
+        if trial["settings"] != updated:
+            remember_completed_epoch_settings(directory, trial)
+            trial.setdefault("initial_settings", copy.deepcopy(trial["settings"]))
+            trial["settings"] = updated
         if new > old:
             report_epochs.update(range(old + 1, new + 1))
-            trial["settings"]["max_epochs"] = new
         selected.add(trial["id"])
     merged["report_epochs"] = sorted(report_epochs)
     # IDs identify persistent outputs; list order follows this invocation's CLI.
@@ -477,8 +506,11 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
 
 def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[list[str], list[dict]]:
     parameter_columns = list(dict.fromkeys([*plan["axes"], *COMMON_COLUMNS]))
+    all_settings = [settings for trial in plan["trials"]
+                    for settings in [trial["settings"],
+                                     *[e["settings"] for e in trial.get("epoch_settings", {}).values()]]]
     parameter_columns = [key for key in parameter_columns
-                         if any(key in t["settings"] for t in plan["trials"])]
+                         if any(key in settings for settings in all_settings)]
     fields = ["trial", "epoch", "superbatch", *METRICS, *EXTREMA,
               *[name + "_sb" for name in EXTREMA], "positions", "lr_start", "lr_end",
               *parameter_columns, "status", "trial_status", "output_dir", "checkpoint"]
@@ -500,8 +532,9 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
                 continue  # Unselected conditions were not extended.
             group = [row for row in rows if int(row["epoch"]) == epoch]
             last = group[-1] if group else {}
-            closed = last and int(last["superbatch"]) == trial["settings"]["superbatches"]
-            row = {key: trial["settings"].get(key, "") for key in parameter_columns}
+            settings = epoch_settings(trial, epoch, group)
+            closed = last and int(last["superbatch"]) == settings["superbatches"]
+            row = {key: settings.get(key, "") for key in parameter_columns}
             if not closed:
                 row.update(trial=trial["id"], epoch=epoch,
                            status="incomplete" if trial_status == "done" else trial_status,
@@ -623,7 +656,7 @@ def run_child(command: list[str], directory: Path, cwd: str, trial_id: int) -> t
 
 
 def command_for(plan: dict, directory: Path, resume: bool) -> list[str]:
-    filename = "bulletou-resume-settings.json" if resume else "bulletou-settings.json"
+    filename = "bulletou-resume-settings.json" if resume else "bulletou-run-settings.json"
     command = [plan["exe"], "--settings-file", str(directory / filename)]
     if resume:
         command.append("--resume")
@@ -635,6 +668,21 @@ def resume_settings(settings: dict) -> dict:
     # resume-config/checkpoints now own both weights and dataloader position.
     return {key: value for key, value in settings.items()
             if key not in {"initial_state", "initial_dataloader_pos"}}
+
+
+def record_settings_launch(directory: Path, trial: dict, resume: bool) -> None:
+    path = directory / "grid-settings-history.json"
+    history = read_json(path) if path.exists() else {"launches": []}
+    rows = log_rows(directory)
+    history["launches"].append({
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "resume": resume,
+        "log_last_point_before_launch": (
+            {"epoch": int(rows[-1]["epoch"]), "superbatch": int(rows[-1]["superbatch"])} if rows else None),
+        "settings": copy.deepcopy(trial["settings"]),
+        "effective_settings": resume_settings(trial["settings"]) if resume else copy.deepcopy(trial["settings"]),
+    })
+    atomic_json(path, history)
 
 
 def main(argv=None) -> int:
@@ -671,6 +719,9 @@ def main(argv=None) -> int:
                 print(f"[ADD PLAN] trial={trial['id']} parameters={trial['parameters']} output={trial_dir(root, trial)}", flush=True)
                 continue
             print(f"[RESUME PLAN] trial={trial['id']} parameters={trial['parameters']} max_epochs={old['settings']['max_epochs']}->{trial['settings']['max_epochs']} output={trial_dir(root, trial)}", flush=True)
+            changes = settings_diff(old["settings"], trial["settings"])
+            if changes:
+                print(f"[SETTINGS CHANGED] trial={trial['id']} (applies on next launch)\n{changes}", flush=True)
     print("[CONFIG] output/output_folder/tag/resume are controlled per trial; all other common settings are preserved", flush=True)
     print(f"[CONFIG] relative teacher/input paths use cwd={plan['cwd']}", flush=True)
     objective_keys = {"wrm_target_scaling", "wrm_target_offset", "wrm_target_epsilon", "wrm_in_scaling", "wrm_in_offset",
@@ -703,6 +754,7 @@ def main(argv=None) -> int:
             atomic_json(manifest_path, plan)
         if args.resume:
             restart_unsaved_trials(root, plan, selected)
+            atomic_json(manifest_path, plan)
         write_summary(root, plan, summary_path)
         print(f"[SUMMARY] initialized: {summary_path}", flush=True)
         for trial in plan["trials"]:
@@ -722,10 +774,13 @@ def main(argv=None) -> int:
             settings_path = directory / "bulletou-settings.json"
             check_trial_settings_file(directory, trial)
             if not settings_path.exists():
-                atomic_json(settings_path, trial["settings"])
+                atomic_json(settings_path, trial.get("initial_settings", trial["settings"]))
             if resume:
                 atomic_json(directory / "bulletou-resume-settings.json", resume_settings(trial["settings"]))
+            else:
+                atomic_json(directory / "bulletou-run-settings.json", trial["settings"])
             command = command_for(plan, directory, resume)
+            record_settings_launch(directory, trial, resume)
             old_elapsed = state.get("elapsed_seconds", 0)
             atomic_json(state_path, {"status": "running", "elapsed_seconds": old_elapsed})
             write_summary(root, plan, summary_path)

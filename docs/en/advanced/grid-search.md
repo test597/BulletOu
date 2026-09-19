@@ -153,7 +153,15 @@ Repeating a command skips completed conditions. Add `--resume` for unfinished co
 
 The previous trial directory is moved intact to `<grid root>/interrupted-runs/<trial-name>-<timestamp>-<identifier>/`, and the trial restarts under its original ID and output directory. Old logs and incomplete saves are preserved but excluded from the new run's aggregate. Stdout prints `[RESTART]` and `[ARCHIVE]`. Completed and unselected conditions are not restarted. No manual deletion or new grid root is necessary.
 
-Ordinary reruns reject a changed plan. With `--resume`, you may select a subset of existing grid conditions and increase their total epoch budget. Other training settings (LR, teacher, batch size, etc.) must remain unchanged. Rebuilding the executable at the same path is allowed, but comparisons across implementations require care. Keep input files, initial state, progress.bin and count.bin contents fixed as well.
+Ordinary reruns reject a changed plan. With `--resume`, the same grid condition resumes its own checkpoint while accepting changes to the common JSON, including LR, batch size, bpu, and save/validation rates. `[SETTINGS CHANGED]` prints the old and new values. Changes apply at the next invocation; the runner does not hot-reload JSON during training.
+
+Explicit grid arguments identify conditions and override common JSON values. For example, `--lrs 0.0001 0.0002` overrides JSON `lr`. A different grid value creates a new condition rather than reusing another condition's checkpoint. Changes to `arch`, `backend`, or `no_ft_factorize` are rejected for checkpoint compatibility. Other settings remain subject to native BulletOu argument and checkpoint validation.
+
+Changing settings alone does not restart completed trials: increase `max_epochs` to extend them. Results after common-setting changes are not equivalent to training with one constant configuration from the beginning. Rebuilding the executable at the same path is allowed, but implementation changes and input-file content changes also affect comparisons.
+
+Each trial's `grid-settings-history.json` records launch settings, timestamps, and the last epoch/sb present in the log before launch. This log position is not the actual checkpoint resume position. Original `bulletou-settings.json` files remain immutable; actual launch settings go into `bulletou-resume-settings.json` (checkpoint resume) or `bulletou-run-settings.json` (fresh run). The common JSON is never written back.
+
+Settings for previously completed epochs are preserved in the manifest, so their LR, bpu and sb columns in `grid_summary.csv` are not relabeled with new settings. An epoch interrupted by a settings change displays the settings used at completion, not a claim that those settings applied throughout the epoch; consult launch history for transitions. If no checkpoint exists, the archived attempt is restarted using the newly requested initial settings.
 
 ### Extend completed conditions
 
@@ -172,7 +180,7 @@ python .\grid_search.py `
 
 - `--epochs 10` is the total endpoint, not ten additional epochs. It overrides the common JSON's `max_epochs`, so that file can remain at five.
 - Grid arguments select conditions; no separate selection flag is needed. Keep all original axis names, but value lists may be narrowed or expanded. With `--resume`, unknown conditions are appended after the highest existing trial ID. Existing IDs, folders and results stay unchanged. New conditions train from the common initial state and teacher position; completed existing conditions are skipped.
-- Example: after `--grid wrm_target_offset 135 270 540 0`, use `--grid wrm_target_offset 70 35 100 135 170 200 235 270 540 0 --resume` with the same output folder to add six conditions. Unselected existing conditions remain in the manifest and aggregate. Completed new conditions join the same `grid_summary.csv`. Changes to common training settings outside the grid axes are rejected. Add `--dry-run` to inspect the additions without writing files or starting training.
+- Example: after `--grid wrm_target_offset 135 270 540 0`, use `--grid wrm_target_offset 70 35 100 135 170 200 235 270 540 0 --resume` with the same output folder to add six conditions. Unselected existing conditions remain in the manifest and aggregate. Completed new conditions join the same `grid_summary.csv`. Common JSON changes apply to selected conditions. Add `--dry-run` to inspect additions and changes without writing files or starting training.
 - Each selected condition resumes its own saved weights, optimizer state and teacher position via native `--resume`. A completed epoch-five checkpoint starts at epoch six; interrupted unsaved progress rolls back to the last checkpoint.
 - IDs and directory names, including their original hashes, stay unchanged. Original `bulletou-settings.json` files stay intact; updated launch settings go into `bulletou-resume-settings.json` and the manifest. The common JSON is never written back.
 - Existing report epochs are preserved and every newly added epoch is included in the same `grid_summary.csv`. With the original epochs 1–5, `--epochs 10` reports 1–10 on extension.
