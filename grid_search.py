@@ -405,6 +405,21 @@ def settings_diff(saved: dict, requested: dict) -> str:
     )
 
 
+def changed_setting_keys(saved: dict, requested: dict) -> list[str]:
+    return sorted(key for key in saved.keys() | requested.keys()
+                  if key not in saved or key not in requested or saved[key] != requested[key])
+
+
+def changed_setting_columns(plan: dict) -> list[str]:
+    columns = list(plan.get("changed_setting_columns", []))
+    # Recover changes recorded by older manifests, including removed settings.
+    for trial in plan["trials"]:
+        for previous in [trial.get("initial_settings", trial["settings"]),
+                         *[e["settings"] for e in trial.get("epoch_settings", {}).values()]]:
+            columns.extend(changed_setting_keys(previous, trial["settings"]))
+    return list(dict.fromkeys(columns))
+
+
 def check_trial_settings_file(directory: Path, trial: dict) -> None:
     path = directory / "bulletou-settings.json"
     if not path.exists():
@@ -453,6 +468,7 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
             or set(stored.get("axes", {})) != set(requested["axes"])):
         raise ValueError("existing grid manifest differs: resume requires the same executable path, cwd and grid axis names")
     merged = copy.deepcopy(stored)
+    merged["changed_setting_columns"] = changed_setting_columns(stored)
     selected = set()
     report_epochs = set(stored["report_epochs"]) | set(requested["report_epochs"])
     for candidate in requested["trials"]:
@@ -490,6 +506,9 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
         check_trial_settings_file(directory, trial)
         updated = {**candidate["settings"], "output": trial["settings"]["output"], "tag": trial["settings"]["tag"]}
         if trial["settings"] != updated:
+            merged["changed_setting_columns"] = list(dict.fromkeys([
+                *merged["changed_setting_columns"], *changed_setting_keys(trial["settings"], updated),
+            ]))
             remember_completed_epoch_settings(directory, trial)
             trial.setdefault("initial_settings", copy.deepcopy(trial["settings"]))
             trial["settings"] = updated
@@ -511,6 +530,7 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
                                      *[e["settings"] for e in trial.get("epoch_settings", {}).values()]]]
     parameter_columns = [key for key in parameter_columns
                          if any(key in settings for settings in all_settings)]
+    parameter_columns = list(dict.fromkeys([*parameter_columns, *changed_setting_columns(plan)]))
     fields = ["trial", "epoch", "superbatch", *METRICS, *EXTREMA,
               *[name + "_sb" for name in EXTREMA], "positions", "lr_start", "lr_end",
               *parameter_columns, "status", "trial_status", "output_dir", "checkpoint"]

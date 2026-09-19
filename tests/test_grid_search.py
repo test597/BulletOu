@@ -698,6 +698,48 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(merged["trials"][0]["settings"]["lr"], 0.0003)
         self.assertEqual(merged["trials"][1:], old["trials"])
 
+    def test_changed_settings_become_columns_with_historical_values(self):
+        argv, old = self.saved_scale_grid()
+        grid.atomic_json(self.settings_path, {**self.common, "sfnn_qat": True, "max_epochs": 3})
+        requested = grid.make_plan(grid.parse_args([*argv, "--resume"]))
+        merged, _ = grid.plan_resume(self.output, old, requested)
+        trial = merged["trials"][0]
+        directory = grid.trial_dir(self.output, trial)
+        self.summary(directory, [*grid.log_rows(directory), self.metrics(epoch=3)])
+        fields, rows = grid.summarize(self.output, merged)
+        rows = [r for r in rows if r["trial"] == trial["id"]]
+        self.assertEqual(fields.count("sfnn_qat"), 1)
+        self.assertEqual([r["sfnn_qat"] for r in rows], ["", "", True])
+        self.assertEqual([r["max_epochs"] for r in rows], [2, 2, 3])
+        self.assertEqual(fields[-1], "checkpoint")
+        # Removing the option retains its column and past explicit value.
+        grid.atomic_json(self.settings_path, {**self.common, "max_epochs": 4})
+        requested = grid.make_plan(grid.parse_args([*argv, "--resume"]))
+        newer, _ = grid.plan_resume(self.output, merged, requested)
+        fields, rows = grid.summarize(self.output, newer)
+        rows = [r for r in rows if r["trial"] == trial["id"]]
+        self.assertIn("sfnn_qat", fields)
+        self.assertEqual([r["sfnn_qat"] for r in rows], ["", "", True, ""])
+
+    def test_changed_column_survives_reverting_before_any_epoch_completes(self):
+        old = self.plan()
+        grid.atomic_json(self.settings_path, {**self.common, "sfnn_qat": True})
+        merged, _ = grid.plan_resume(self.output, old, self.plan())
+        grid.atomic_json(self.settings_path, self.common)
+        reverted, _ = grid.plan_resume(self.output, merged, self.plan())
+        self.assertIn("sfnn_qat", reverted["changed_setting_columns"])
+        fields, rows = grid.summarize(self.output, reverted)
+        self.assertIn("sfnn_qat", fields)
+        self.assertTrue(all(row["sfnn_qat"] == "" for row in rows))
+
+    def test_older_manifest_changes_are_discovered_for_summary_only(self):
+        plan = self.plan()
+        trial = plan["trials"][0]
+        trial["initial_settings"] = {**trial["settings"], "sfnn_qat": False}
+        trial["settings"]["sfnn_qat"] = True
+        fields, _ = grid.summarize(self.output, plan)
+        self.assertIn("sfnn_qat", fields)
+
     def test_common_changes_without_checkpoint_restart_with_new_launch_settings(self):
         def interrupted(command, directory, cwd, trial_id):
             self.summary(directory, [self.metrics(sb=2)])

@@ -163,6 +163,8 @@ Each trial's `grid-settings-history.json` records launch settings, timestamps, a
 
 Settings for previously completed epochs are preserved in the manifest, so their LR, bpu and sb columns in `grid_summary.csv` are not relabeled with new settings. An epoch interrupted by a settings change displays the settings used at completion, not a claim that those settings applied throughout the epoch; consult launch history for transitions. If no checkpoint exists, the archived attempt is restarted using the newly requested initial settings.
 
+Changed, added or removed settings automatically become columns in `grid_summary.csv`, even outside the predefined summary fields. For example, enabling QAT during training adds its setting column with historical values for completed epochs and new values afterward. Columns remain after reverting or removing a setting. Unspecified values are blank; native BulletOu defaults are not guessed. Additional columns follow existing condition columns and precede status/administrative columns; checkpoint remains last. Changes recorded in older manifests' initial and per-epoch settings are also recovered.
+
 ### Extend completed conditions
 
 Normal runs and `--resume` follow **the current command-line condition order** for execution and CSV display, like normal YOSC runs. Values are not numerically sorted; existing and new conditions share the same ordering. Unselected existing conditions follow at the end in their previous relative order. IDs and output paths remain unchanged, so trial IDs need not be ascending in the CSV. `--summary-only` retains the last order stored in the manifest.
