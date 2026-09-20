@@ -2364,6 +2364,8 @@ pub fn sfnn_build_quantized_proxy_device(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarLossKind {
     BceWithLogits,
+    /// Stop-gradient error weighting, normalized over this mini-batch.
+    BceErrorWeighted { k: f32 },
     SigmoidPow { pow_exp: f32 },
     WinRateModel { pow_exp: f32, in_offset_over_scaling: f32 },
 }
@@ -2371,7 +2373,7 @@ pub enum ScalarLossKind {
 impl ScalarLossKind {
     fn as_ffi(self) -> i32 {
         match self {
-            Self::BceWithLogits => 2,
+            Self::BceWithLogits | Self::BceErrorWeighted { .. } => 2,
             Self::SigmoidPow { .. } => 0,
             Self::WinRateModel { .. } => 1,
         }
@@ -2379,7 +2381,7 @@ impl ScalarLossKind {
 
     fn loss_pow_exp(self) -> f32 {
         match self {
-            Self::BceWithLogits => 2.0,
+            Self::BceWithLogits | Self::BceErrorWeighted { .. } => 2.0,
             Self::SigmoidPow { pow_exp } => pow_exp,
             Self::WinRateModel { pow_exp, .. } => pow_exp,
         }
@@ -2388,6 +2390,7 @@ impl ScalarLossKind {
     fn loss_param(self) -> f32 {
         match self {
             Self::BceWithLogits => 0.0,
+            Self::BceErrorWeighted { k } => k,
             Self::SigmoidPow { .. } => 0.0,
             Self::WinRateModel { in_offset_over_scaling, .. } => in_offset_over_scaling,
         }
@@ -10736,6 +10739,50 @@ mod tests {
         let device = workspace.download(&ctx).unwrap();
         assert_close_slice("BCE device loss", &device.per_sample, &host.per_sample, 1e-6);
         assert_close_slice("BCE device gradient", &device.mean_output_gradients, &host.mean_output_gradients, 1e-6);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn bce_error_weight_gpu_smoke() {
+        let ctx = Context::new(0).unwrap();
+        for n in [1, 3, 257, 65536] {
+            let outputs: Vec<f32> = (0..n).map(|i| [-100.0, -1.0, 0.0, 1.0, 100.0][i % 5]).collect();
+            let targets: Vec<f32> = (0..n).map(|i| [0.9, 0.0, 0.5, 0.3, 1.0][i % 5]).collect();
+            let weights: Vec<f32> = (0..n).map(|i| [1.0, 0.0, 0.5][i % 3]).collect();
+            let batch = ScalarLossHostBatch { outputs: &outputs, targets: &targets, entry_weights: &weights };
+            let plain = scalar_loss_host(0, ScalarLossKind::BceWithLogits, 1.0, batch).unwrap();
+            let device_batch = ScalarLossDeviceBatch::from_host(&ctx, batch).unwrap();
+            let workspace = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(n)).unwrap();
+            let errors: Vec<f64> = outputs.iter().zip(&targets).map(|(&z, &t)|
+                (1.0 / (1.0 + (-f64::from(z)).exp()) - f64::from(t)).abs()).collect();
+            let mean_error = errors.iter().zip(&weights).map(|(e, &w)| e * f64::from(w)).sum::<f64>()
+                / weights.iter().map(|&w| f64::from(w)).sum::<f64>();
+            for k in [0.0, 1.0, 2.0, f32::MAX] {
+                for finalize in [true, false] {
+                    scalar_loss_device_from_buffers_with_finalize(&ctx, ScalarLossKind::BceErrorWeighted { k },
+                        1.0, n, &device_batch.outputs, &device_batch.targets, &device_batch.entry_weights,
+                        &workspace, finalize).unwrap();
+                    let actual = workspace.download(&ctx).unwrap();
+                    for i in 0..n {
+                        let w = ((1.0 + f64::from(k) * errors[i]) / (1.0 + f64::from(k) * mean_error)) as f32;
+                        assert_close("weighted BCE loss", actual.per_sample[i], plain.per_sample[i] * w, 1e-4);
+                        assert_close("detached BCE gradient", actual.mean_output_gradients[i], plain.mean_output_gradients[i] * w, 1e-6);
+                    }
+                    if k == 0.0 {
+                        assert_eq!(actual.per_sample, plain.per_sample);
+                        assert_eq!(actual.mean_output_gradients, plain.mean_output_gradients);
+                    }
+                }
+            }
+        }
+        let zeros = [0.0; 3];
+        let masked = ScalarLossHostBatch { outputs: &zeros, targets: &zeros, entry_weights: &zeros };
+        let report = scalar_loss_host(0, ScalarLossKind::BceErrorWeighted { k: 2.0 }, 1.0, masked).unwrap();
+        assert_eq!(report.mean, 0.0);
+        assert_eq!(report.mean_output_gradients, zeros);
+        for k in [-1.0, f32::NAN, f32::INFINITY] {
+            assert!(scalar_loss_host(0, ScalarLossKind::BceErrorWeighted { k }, 1.0, masked).is_err());
+        }
     }
 
     #[test]

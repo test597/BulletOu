@@ -4732,6 +4732,11 @@ struct Args {
     #[arg(long, conflicts_with_all = ["loss_sigmoid_mse", "win_rate_model"])]
     loss_bce_with_logits: bool,
 
+    /// BCE training-only error weight: 1 + k*abs(prediction-target), detached
+    /// and normalized to mean 1 per mini-batch. Validation remains plain BCE.
+    #[arg(long, default_value_t = 0.0)]
+    bce_error_weight_k: f32,
+
     /// Exponent of the probability-space error term `|prediction - target|^p`.
     /// `2.0` is squared error; `1.5`, `2.5`, etc. are experiment knobs.
     #[arg(long, default_value = "2.0")]
@@ -5421,6 +5426,7 @@ impl Args {
             return Err(format!("--wrm-target-scaling must be finite and > 0 (got {})", self.wrm_target_scaling));
         }
         validate_bce_options(self.loss_bce_with_logits, self.wrm_in_offset, self.loss_pow_exp)?;
+        validate_bce_error_weight(self.bce_error_weight_k, self.loss_bce_with_logits)?;
         validate_wrm_target_epsilon(self.wrm_target_epsilon, effective_win_rate_model(self))?;
         if let Some(scale) = self.scale {
             if !(scale.is_finite() && scale > 0.0) {
@@ -5695,6 +5701,16 @@ fn validate_bce_options(enabled: bool, offset: f32, pow_exp: f32) -> Result<(), 
     Ok(())
 }
 
+fn validate_bce_error_weight(k: f32, bce: bool) -> Result<(), String> {
+    if !k.is_finite() || k < 0.0 {
+        return Err("--bce-error-weight-k must be finite and >= 0".into());
+    }
+    if k != 0.0 && !bce {
+        return Err("--bce-error-weight-k requires --loss-bce-with-logits".into());
+    }
+    Ok(())
+}
+
 fn validate_wrm_target_epsilon(epsilon: f32, wrm: bool) -> Result<(), String> {
     if !epsilon.is_finite() || !(0.0..0.5).contains(&epsilon) {
         return Err("--wrm-target-epsilon must be finite and 0 <= epsilon < 0.5".to_string());
@@ -5824,7 +5840,13 @@ fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
-    if args.loss_bce_with_logits { return bulletou_cuda_cpp::ScalarLossKind::BceWithLogits; }
+    if args.loss_bce_with_logits {
+        return if args.bce_error_weight_k == 0.0 {
+            bulletou_cuda_cpp::ScalarLossKind::BceWithLogits
+        } else {
+            bulletou_cuda_cpp::ScalarLossKind::BceErrorWeighted { k: args.bce_error_weight_k }
+        };
+    }
     if effective_win_rate_model(args) {
         bulletou_cuda_cpp::ScalarLossKind::WinRateModel {
             pow_exp: effective_loss_pow_exp(args),
@@ -5836,7 +5858,7 @@ fn cuda_cpp_scalar_loss_kind(args: &Args) -> bulletou_cuda_cpp::ScalarLossKind {
 }
 
 fn value_loss_label(args: &Args) -> String {
-    if args.loss_bce_with_logits { return format!("bce-with-logits(nnue2score={}, in_scaling={}, target={}/{}, epsilon={})", args.wrm_nnue2score, args.wrm_in_scaling, args.wrm_target_offset, args.wrm_target_scaling, args.wrm_target_epsilon); }
+    if args.loss_bce_with_logits { return format!("bce-with-logits(nnue2score={}, in_scaling={}, target={}/{}, epsilon={}, training_error_weight_k={}, detached=true, batch_normalized=true; validation=plain-BCE)", args.wrm_nnue2score, args.wrm_in_scaling, args.wrm_target_offset, args.wrm_target_scaling, args.wrm_target_epsilon, args.bce_error_weight_k); }
     let pow_exp = effective_loss_pow_exp(args);
     if effective_win_rate_model(args) {
         let target = effective_wrm_target_params(args);
@@ -24933,6 +24955,7 @@ fn resume_signature(args: &Args) -> String {
         format!("fv_scale={fv_scale_signature}"),
         format!("win_rate_model={}", effective_win_rate_model(args)),
         format!("loss_bce_with_logits={}", args.loss_bce_with_logits),
+        format!("bce_error_weight_k={:.9}", args.bce_error_weight_k),
         format!("loss_pow_exp={:.9}", effective_loss_pow_exp(args)),
         format!("wrm_nnue2score={:.9}", effective_wrm_nnue2score(args)),
         format!("wrm_in_offset={:.9}", effective_wrm_in_offset(args)),
@@ -25129,7 +25152,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "quantized_validation_exact=false",
     );
     ensure_line_after(&mut out, "loss_bce_with_logits=", "win_rate_model=", "loss_bce_with_logits=false");
-    ensure_line_after(&mut out, "loss_pow_exp=", "loss_bce_with_logits=", "loss_pow_exp=2.000000000");
+    ensure_line_after(&mut out, "bce_error_weight_k=", "loss_bce_with_logits=", "bce_error_weight_k=0.000000000");
+    ensure_line_after(&mut out, "loss_pow_exp=", "bce_error_weight_k=", "loss_pow_exp=2.000000000");
     ensure_line_after(&mut out, "wrm_nnue2score=", "loss_pow_exp=", "wrm_nnue2score=600.000000000");
     ensure_line_after(&mut out, "wrm_in_offset=", "wrm_nnue2score=", "wrm_in_offset=270.000000000");
     ensure_line_after(&mut out, "wrm_in_scaling=", "wrm_in_offset=", "wrm_in_scaling=340.000000000");
@@ -33326,6 +33350,27 @@ mod tests {
         let q = QuantizedTestArgs::try_parse_from(["quantized-test", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--nn-bin", "nn.bin", "--test-teacher", "test.psv", "--loss-bce-with-logits", "--wrm-in-offset", "0"]).unwrap();
         assert!(matches!(quantized_train_scale_loss_kind(&q), ValidationLossKind::BceWithLogits { nnue2score: 600.0, .. }));
         assert!(matches!(quantized_engine_scale_loss_kind(&q), ValidationLossKind::BceWithLogits { nnue2score: 1.0, .. }));
+    }
+
+    #[test]
+    fn bce_error_weight_cli_json_and_validation_is_plain() {
+        let mut argv: Vec<std::ffi::OsString> = ["bulletou", "--teacher", "/dev/null", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--superbatches", "1", "--max-epochs", "1", "--wrm-in-offset", "0", "--loss-bce-with-logits"].map(Into::into).to_vec();
+        let base = Args::try_parse_from(argv.clone()).unwrap();
+        let old = resume_signature_without_line(&resume_signature(&base), "bce_error_weight_k=");
+        assert!(resume_signature_matches(&old, &base));
+        bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"), "bce_error_weight_k", &serde_json::json!(2), &mut argv).unwrap();
+        let mut weighted = Args::try_parse_from(argv).unwrap();
+        assert!(weighted.validate_backend_flags().is_ok());
+        assert!(matches!(cuda_cpp_scalar_loss_kind(&weighted), bulletou_cuda_cpp::ScalarLossKind::BceErrorWeighted { k: 2.0 }));
+        assert_eq!(format!("{:?}", validation_loss_kind(&base)), format!("{:?}", validation_loss_kind(&weighted)));
+        assert!(!resume_signature_matches(&old, &weighted));
+        for k in [-1.0, f32::NAN, f32::INFINITY] {
+            weighted.bce_error_weight_k = k;
+            assert!(weighted.validate_backend_flags().is_err());
+        }
+        weighted.bce_error_weight_k = 1.0;
+        weighted.loss_bce_with_logits = false;
+        assert!(weighted.validate_backend_flags().is_err());
     }
 
     #[test]

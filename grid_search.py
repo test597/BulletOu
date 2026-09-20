@@ -50,7 +50,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
 COMMON_COLUMNS = (
     "arch", "lr", "lr_min", "lr_schedule", "batch_size", "batches_per_update",
     "positions_per_superbatch", "superbatches", "sfnn_factorizer",
-    "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "loss_bce_with_logits", "wrm_nnue2score", "wrm_in_scaling",
+    "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "loss_bce_with_logits", "bce_error_weight_k", "wrm_nnue2score", "wrm_in_scaling",
     "wrm_target_scaling", "wrm_target_epsilon", "wrm_in_offset", "wrm_target_offset", "loss_pow_exp",
 )
 MANIFEST = "grid-manifest.json"
@@ -176,6 +176,11 @@ def check_settings(settings: dict) -> None:
     for key in ("lr", "lr_min", "wrm_target_scaling", "wrm_in_scaling", "wrm_nnue2score"):
         if key in settings and (type(settings[key]) not in (float, int) or settings[key] <= 0):
             raise ValueError(f"{key} must be positive")
+    k = settings.get("bce_error_weight_k", 0)
+    if isinstance(k, bool) or not isinstance(k, (int, float)) or not math.isfinite(k) or k < 0:
+        raise ValueError("bce_error_weight_k must be finite and >= 0")
+    if k != 0 and not settings.get("loss_bce_with_logits"):
+        raise ValueError("bce_error_weight_k requires loss_bce_with_logits: true")
     if settings.get("loss_bce_with_logits"):
         if settings.get("loss_sigmoid_mse") or settings.get("win_rate_model"):
             raise ValueError("loss_bce_with_logits conflicts with loss_sigmoid_mse / win_rate_model")

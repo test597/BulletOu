@@ -54,3 +54,31 @@ python .\grid_search.py `
 ```
 
 falseは従来のWRM二乗誤差、trueはBCEです。`grid_summary.csv` に `loss_bce_with_logits` が記録されます。lossの定義が変わるため、値の大小で方式間の優劣を決めないでください。既存モデルから試す場合も、条件ごとに同じcheckpoint/教師位置から始めてください。
+
+## 誤差が大きい局面を重視するBCE
+
+学習引数 `--bce-error-weight-k K`（JSON: `"bce_error_weight_k": K`）で、予測勝率と教師勝率の差が大きい局面への重み付けを試せます。デフォルトは **0（通常のBCE）**。有限の0以上だけ指定でき、0以外は `loss_bce_with_logits: true` が必要です。教師epsilonを有効にする必要はありません。
+
+```text
+e_i = abs(p_i - t_i)
+w_i = 1 + K * e_i
+mean_w = sum(entry_weight_i * w_i) / sum(entry_weight_i)
+a_i = stop_gradient(w_i / mean_w)
+training_loss = mean(entry_weight_i * a_i * BCE(z_i, t_i))
+gradient_i = entry_weight_i * a_i * (p_i - t_i) * nnue2score / in_scaling / batch_size
+```
+
+`entry_weight` は既存の局面weightです。すべて1なら通常のbatch平均で正規化し、0の除外局面は正規化に含めません。全局面が除外なら勾配とlossは0です。分子・分母の**両方に微分を通しません**。正規化は1 mini-batch単位で、bpuでまとめた全batch単位ではありません。Kを大きくすると誤差が大きい局面を相対的に重視しますが、教師の誤りも強調する可能性があります。
+
+**検証のloss/qlossはKによらず通常のBCEです。** train loss readbackを有効にした場合の学習lossには上記の重みが掛かりますが、検証には掛けません。これにより同じ検証条件のK違いを共通の基準で比較できます。acc/qaccの定義も変わりません。`quantized-test` にはKを指定する必要はありません。
+
+共通JSONでBCEを有効にし、`wrm_in_offset: 0`、`win_rate_model: false`、`loss_sigmoid_mse: false` として実行します。
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
+  --output-folder D:\BulletOu-snapshots\grid-bce-error-weight `
+  --grid bce_error_weight_k 0 1 2
+```
+
+`grid_summary.csv`には `bce_error_weight_k` 列を出します。K=0では既存のBCE経路をそのまま使います。K>0ではGPUカーネルが2回追加されますが、既存の小さなloss作業領域を再利用し、追加VRAM確保やCPU読み戻しはありません。実学習の速度への影響は未測定です。

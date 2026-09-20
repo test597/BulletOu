@@ -4,6 +4,8 @@
 
 Use `--grid loss_bce_with_logits false true` to compare squared error with BCE. Set the common `wrm_in_offset` to0 and disable explicit `win_rate_model` / `loss_sigmoid_mse` flags. See [BCE formulas and caveats](bce-with-logits.md).
 
+With common JSON `loss_bce_with_logits: true`, use `--grid bce_error_weight_k 0 1 2` to compare error-weighted BCE training. Zero is ordinary BCE. Validation loss/qloss remain ordinary BCE for all K values; the coefficient is recorded in `grid_summary.csv`. See [formula and normalization](bce-with-logits.md#error-weighted-bce-training).
+
 Use `--grid sfnn_norm_loss_strength 0 0.000001 0.00001 0.0001` to compare SFNN norm regularization. See [Norm loss: scope, formula and examples](norm-loss.md).
 
 [日本語](../../ja/advanced/grid-search.md)

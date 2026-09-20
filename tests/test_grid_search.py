@@ -118,6 +118,19 @@ class GridSearchTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 grid.check_settings({**self.common, "loss_bce_with_logits": True, **bad})
 
+    def test_bce_error_weight_grid(self):
+        grid.atomic_json(self.settings_path, {**self.common, "loss_bce_with_logits": True})
+        plan = self.plan(["--grid", "bce_error_weight_k", "0", "1", "2"])
+        self.assertEqual(len(plan["trials"]), 6)
+        fields, rows = grid.summarize(self.output, plan)
+        self.assertEqual(fields.count("bce_error_weight_k"), 1)
+        self.assertEqual({r["bce_error_weight_k"] for r in rows}, {0, 1, 2})
+        for k in [-1, float("nan"), float("inf"), True]:
+            with self.assertRaises(ValueError):
+                grid.check_settings({**self.common, "loss_bce_with_logits": True, "bce_error_weight_k": k})
+        with self.assertRaisesRegex(ValueError, "requires loss_bce"):
+            grid.check_settings({**self.common, "bce_error_weight_k": 1})
+
     def test_target_epsilon_grid_and_summary(self):
         plan = self.plan(["--wrm-target-epsilons", "0", "0.005", "0.01"])
         self.complete_plan(plan)

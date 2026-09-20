@@ -2062,6 +2062,49 @@ __global__ void loss_bce_with_logits_reduce_kernel(
         * output_inv_scale / static_cast<float>(batch);
 }
 
+// Reuse the loss workspace scalar before loss finalization. Entry weights
+// exclude masked samples from normalization; no CPU readback or allocation.
+__global__ void bce_mean_error_kernel(
+    const float* outputs, const float* targets, const float* entry_weights,
+    float scale, size_t batch, float* mean_error) {
+    __shared__ double errors[256];
+    __shared__ double weights[256];
+    const int lane = threadIdx.x;
+    double e = 0.0, w = 0.0;
+    for (size_t i = lane; i < batch; i += blockDim.x) {
+        if (entry_weights[i] > 0.0f) {
+            e += static_cast<double>(entry_weights[i]) * fabsf(loss_sigmoid(outputs[i] * scale) - targets[i]);
+            w += entry_weights[i];
+        }
+    }
+    errors[lane] = e;
+    weights[lane] = w;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            errors[lane] += errors[lane + stride];
+            weights[lane] += weights[lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane == 0) *mean_error = weights[0] > 0.0 ? static_cast<float>(errors[0] / weights[0]) : 0.0f;
+}
+
+__global__ void bce_apply_error_weight_kernel(
+    const float* outputs, const float* targets, const float* entry_weights,
+    float* per_sample, float* gradients, const float* mean_error,
+    float scale, float k, size_t batch) {
+    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch || entry_weights[i] == 0.0f) return;
+    const float error = fabsf(loss_sigmoid(outputs[i] * scale) - targets[i]);
+    // Double intermediates avoid overflow for large finite k. Both numerator
+    // and denominator are detached: do not differentiate through the weight.
+    const float weight = static_cast<float>((1.0 + static_cast<double>(k) * error)
+        / (1.0 + static_cast<double>(k) * *mean_error));
+    per_sample[i] *= weight;
+    gradients[i] *= weight;
+}
+
 __global__ void loss_sigmoid_pow_reduce_kernel(
     const float* outputs,
     const float* targets,
@@ -6682,6 +6725,9 @@ int validate_scalar_loss(size_t batch, int kind, float loss_pow_exp, float loss_
     if (kind == 1 && !std::isfinite(loss_param)) {
         return fail_message("WRM loss parameter must be finite");
     }
+    if (kind == 2 && !(std::isfinite(loss_param) && loss_param >= 0.0f)) {
+        return fail_message("BCE error weight k must be finite and >= 0");
+    }
     return 0;
 }
 
@@ -6717,6 +6763,15 @@ int launch_scalar_loss_kernels(
         loss_bce_with_logits_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
             outputs, targets, entry_weights, per_sample, mean_output_gradients, output_inv_scale, batch);
         if (check_kernel_launch("loss_bce_with_logits_reduce_kernel launch") != 0) return -1;
+        if (loss_param > 0.0f) {
+            bce_mean_error_kernel<<<1, threads, 0, ctx->stream>>>(
+                outputs, targets, entry_weights, output_inv_scale, batch, weighted_sum);
+            if (check_kernel_launch("bce_mean_error_kernel launch") != 0) return -1;
+            bce_apply_error_weight_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                outputs, targets, entry_weights, per_sample, mean_output_gradients,
+                weighted_sum, output_inv_scale, loss_param, batch);
+            if (check_kernel_launch("bce_apply_error_weight_kernel launch") != 0) return -1;
+        }
     } else if (kind == 0) {
         loss_sigmoid_pow_reduce_kernel<<<blocks, threads, 0, ctx->stream>>>(
             outputs,

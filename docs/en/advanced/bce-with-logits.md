@@ -54,3 +54,31 @@ python .\grid_search.py `
 ```
 
 False selects the existing WRM squared error; true selects BCE. `grid_summary.csv` records `loss_bce_with_logits`. Do not rank different loss definitions by their numerical loss values. For continued-training comparisons, start each condition from the same checkpoint and teacher position.
+
+## Error-weighted BCE training
+
+`--bce-error-weight-k K` (JSON: `"bce_error_weight_k": K`) increases the relative contribution of samples with larger probability errors. The default **0 preserves ordinary BCE**. K must be finite and nonnegative; nonzero K requires `loss_bce_with_logits: true`. Teacher epsilon is not required.
+
+```text
+e_i = abs(p_i - t_i)
+w_i = 1 + K * e_i
+mean_w = sum(entry_weight_i * w_i) / sum(entry_weight_i)
+a_i = stop_gradient(w_i / mean_w)
+training_loss = mean(entry_weight_i * a_i * BCE(z_i, t_i))
+gradient_i = entry_weight_i * a_i * (p_i - t_i) * nnue2score / in_scaling / batch_size
+```
+
+Both numerator and denominator are detached. Existing entry weights define the normalization population: with all ones this is the ordinary batch mean; zero-weight masked samples are excluded. An all-masked batch produces zero loss and gradients. Normalization is per mini-batch, not across all batches accumulated by bpu. Larger K emphasizes large errors, including possible teacher errors.
+
+**Validation loss/qloss remain ordinary BCE, independent of K.** Training loss readback includes the weighting, but validation does not. Thus K trials retain a common validation objective. Accuracy definitions are unchanged; do not pass K to `quantized-test`.
+
+Enable BCE in the common JSON, with `wrm_in_offset: 0`, `win_rate_model: false`, and `loss_sigmoid_mse: false`:
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
+  --output-folder D:\BulletOu-snapshots\grid-bce-error-weight `
+  --grid bce_error_weight_k 0 1 2
+```
+
+The aggregate includes `bce_error_weight_k`. K=0 retains the existing BCE kernel path. K>0 adds two GPU kernel launches, reusing existing scalar loss scratch space without additional VRAM allocation or CPU readback. Training throughput impact has not been measured.
