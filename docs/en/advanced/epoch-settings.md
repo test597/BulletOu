@@ -36,6 +36,8 @@ Unsupported maps fail explicitly. Architecture, batch size, teacher, factorizer 
 
 ## Accumulation alignment
 
-Scheduled BPU rounds batches/SB down to a multiple of the least common multiple of all scheduled BPUs, identically across epochs. This prevents pending accumulated gradients at SB/checkpoint/epoch boundaries. For 40M positions, batch size 65,536 and BPU 1→4, every epoch uses 608 batches/SB (39,845,888 positions), rather than the 610 used by constant BPU=1. Check startup batches/SB when editing the BPU schedule on resume.
+Batches/SB are rounded down using **only the BPU active in that epoch**, preventing pending accumulated gradients at SB/checkpoint/epoch boundaries. Future settings do not affect current batch counts, LR periods, or optimizer update boundaries. With 40M positions, batch size 65,536, epoch1 BPU=1 and epoch11 BPU=4, epochs 1–10 use 610 batches/SB (39,976,960 positions); epochs 11 onward use 608 (39,845,888 positions). If max_epochs=5, the epoch11 entry has no effect on rounding.
+
+The teacher shuffle window uses the settings active at startup and remains fixed within that execution; future BPUs do not affect it. Startup still validates the settings and builds the execution plan, but future values are not applied to current training computations.
 
 [Grid search](grid-search.md) / [日本語](../../ja/advanced/epoch-settings.md)

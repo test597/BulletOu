@@ -4298,21 +4298,7 @@ fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
         return Err("--batch-size must be > 0.".to_string());
     }
     let raw_batches = args.positions_per_superbatch / batch_size;
-    let mut batches_per_update = args.batches_per_update.max(1);
-    // Keep SB geometry constant across resume/epoch changes, and never save
-    // with a partially accumulated update. Round to the LCM of scheduled BPUs.
-    if let Some(json) = args.epoch_settings_json.as_ref() {
-        let schedules: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        if let Some(values) = schedules.get("batches_per_update").and_then(|v| v.as_object()) {
-            for value in values.values() {
-                let n: usize = serde_json::from_value(value.clone()).map_err(|e| format!("batches_per_update: {e}"))?;
-                if n == 0 { return Err("batches_per_update must be > 0".into()); }
-                let (mut a, mut b) = (batches_per_update, n);
-                while b != 0 { (a, b) = (b, a % b); }
-                batches_per_update = (batches_per_update / a).checked_mul(n).ok_or("scheduled BPU alignment overflow")?;
-            }
-        }
-    }
+    let batches_per_update = args.batches_per_update.max(1);
     let batches = raw_batches - (raw_batches % batches_per_update);
     if batches == 0 {
         if batches_per_update == 1 {
@@ -18035,6 +18021,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             if active_epoch != Some(progress.epoch) && base_args.epoch_settings_json.is_some() {
                 ctx.synchronize().map_err(|e| e.to_string())?;
                 epoch_args = args_at_epoch(base_args, progress.epoch)?;
+                schedule.batches_per_superbatch = progress.batches_per_superbatch;
                 schedule.batches_per_update = epoch_args.batches_per_update;
                 schedule.lr_step_gamma = effective_lr_step_gamma(&epoch_args, schedule.batches_per_superbatch)?.0;
                 let changes: serde_json::Map<String, serde_json::Value> = serde_json::from_str(base_args.epoch_settings_json.as_ref().unwrap()).map_err(|e| e.to_string())?;
@@ -18051,7 +18038,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, args.max_epochs);
         sfnn_diagnostics.observe_teacher(teacher_batch.timing);
         let batches_per_update = args.batches_per_update;
-        let is_optimizer_step = seen_steps % batches_per_update == 0;
+        let is_optimizer_step = progress_for_step
+            .map(|p| p.batch_in_superbatch % batches_per_update == 0)
+            .unwrap_or(seen_steps % batches_per_update == 0);
         let optimizer_step = optimizer_step_offset + optimizer_updates + usize::from(is_optimizer_step);
         let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
@@ -24283,6 +24272,8 @@ fn print_cuda_cpp_no_remaining_work(args: &Args) {
 struct CudaCppScheduleChunk {
     epoch: usize,
     superbatch: usize,
+    batches_per_superbatch: usize,
+    batches_per_update: usize,
     steps: usize,
     cumulative_steps: usize,
     save_checkpoint: bool,
@@ -24311,6 +24302,15 @@ struct CudaCppRunSchedule {
 #[cfg(feature = "cuda-cpp-backend")]
 impl CudaCppRunSchedule {
     fn lr_for_step(&self, args: &Args, step_index: usize, batch_size: usize) -> f32 {
+        if self.production && args.epoch_settings_json.is_some() {
+            if let Some(progress) = self.progress_for_step(step_index.saturating_add(1)) {
+                let epoch_step = (progress.superbatch - 1) * progress.batches_per_superbatch
+                    + progress.batch_in_superbatch - 1;
+                return cuda_cpp_lr_at_step(args, epoch_step, batch_size, 0,
+                    (self.superbatches_per_epoch as u64) * progress.batches_per_superbatch as u64 * batch_size as u64,
+                    self.lr_step_gamma, effective_lr_step_positions(args, progress.batches_per_superbatch));
+            }
+        }
         if self.production {
             cuda_cpp_lr_at_step(
                 args,
@@ -24330,8 +24330,8 @@ impl CudaCppRunSchedule {
         if seen_steps == 0 {
             return None;
         }
-        let batches_per_superbatch = self.batches_per_superbatch.max(1);
         for chunk in &self.chunks {
+            let batches_per_superbatch = chunk.batches_per_superbatch.max(1);
             let chunk_start = chunk.cumulative_steps.saturating_sub(chunk.steps);
             if seen_steps <= chunk_start || seen_steps > chunk.cumulative_steps {
                 continue;
@@ -24345,7 +24345,7 @@ impl CudaCppRunSchedule {
                 superbatches_per_epoch: self.superbatches_per_epoch,
                 batch_in_superbatch: offset % batches_per_superbatch + 1,
                 batches_per_superbatch,
-                batches_per_update: self.batches_per_update.max(1),
+                batches_per_update: chunk.batches_per_update.max(1),
             });
         }
         None
@@ -24667,6 +24667,8 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             chunks: vec![CudaCppScheduleChunk {
                 epoch: 1,
                 superbatch: 1,
+                batches_per_superbatch: train_steps,
+                batches_per_update,
                 steps: train_steps,
                 cumulative_steps: train_steps,
                 save_checkpoint: true,
@@ -24779,14 +24781,11 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     for epoch in start_epoch..=max_epochs {
         let epoch_args = args_at_epoch(args, epoch)?;
         let args = &epoch_args;
+        let batches_per_superbatch = effective_batches_per_superbatch(args)?;
         let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)?.0;
-        if args.epoch_settings_json.is_some() {
-            let epoch_batches = superbatches.checked_mul(batches_per_superbatch).ok_or("epoch batch count overflow")?;
-            if epoch_batches % args.batches_per_update != 0
-                || (epoch == start_epoch && (first_epoch_start_superbatch - 1) * batches_per_superbatch % args.batches_per_update != 0) {
-                return Err(format!("epoch {epoch}: batches_per_update={} must divide epoch batches ({epoch_batches}) and the resume batch offset; no accumulated gradients may cross epoch boundaries", args.batches_per_update));
-            }
-        }
+        let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
+        let lr_period = (superbatches as u64).checked_mul(batches_per_superbatch as u64)
+            .and_then(|n| n.checked_mul(batch_size as u64)).ok_or("epoch LR period overflow")?;
         let mut first_superbatch = if epoch == start_epoch { first_epoch_start_superbatch } else { 1 };
         while first_superbatch <= superbatches {
             let save_boundary = save_period_sbs.map(|rate| next_superbatch_rate_boundary(first_superbatch, rate));
@@ -24820,16 +24819,16 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             let steps = superbatch_count.checked_mul(batches_per_superbatch).ok_or_else(|| {
                 format!("cuda-cpp chunk step overflow at epoch={epoch}, superbatch={last_superbatch}")
             })?;
-            let chunk_start_step = cumulative_steps;
+            let chunk_start_step = (first_superbatch - 1).checked_mul(batches_per_superbatch).ok_or("epoch step overflow")?;
             cumulative_steps = cumulative_steps.checked_add(steps).ok_or_else(|| {
                 format!("cuda-cpp cumulative step overflow at epoch={epoch}, superbatch={last_superbatch}")
             })?;
-            let chunk_end_step = cumulative_steps.saturating_sub(1);
+            let chunk_end_step = chunk_start_step.checked_add(steps).ok_or("epoch step overflow")?.saturating_sub(1);
             let lr_start = cuda_cpp_lr_at_step(
                 args,
                 chunk_start_step,
                 batch_size,
-                lr_position_offset,
+                0,
                 lr_period,
                 lr_step_gamma,
                 lr_step_positions,
@@ -24838,7 +24837,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 args,
                 chunk_end_step,
                 batch_size,
-                lr_position_offset,
+                0,
                 lr_period,
                 lr_step_gamma,
                 lr_step_positions,
@@ -24846,6 +24845,8 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             chunks.push(CudaCppScheduleChunk {
                 epoch,
                 superbatch: last_superbatch,
+                batches_per_superbatch,
+                batches_per_update: args.batches_per_update,
                 steps,
                 cumulative_steps,
                 save_checkpoint,
@@ -24858,6 +24859,8 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         }
     }
     let total_steps = chunks.iter().map(|chunk| chunk.steps).sum();
+    let batches_per_superbatch = chunks.first().map(|c| c.batches_per_superbatch).unwrap_or(batches_per_superbatch);
+    let batches_per_update = chunks.first().map(|c| c.batches_per_update).unwrap_or(batches_per_update);
     Ok(CudaCppRunSchedule {
         production: true,
         total_steps,
@@ -27155,7 +27158,8 @@ mod tests {
     #[test]
     fn epoch_settings_values_false_and_signature() {
         let mut args = Args::try_parse_from(["bulletou", "--teacher", "/dev/null",
-            "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--superbatches", "2", "--max-epochs", "12"]).unwrap();
+            "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--superbatches", "2", "--max-epochs", "12",
+            "--positions-per-superbatch", "40000000"]).unwrap();
         args.epoch_settings_json = Some(serde_json::json!({
             "lr": {"epoch1": 0.0004, "epoch11": 0.0002},
             "lr_min": {"epoch1": 0.00005, "epoch11": 0.00002},
@@ -27173,7 +27177,8 @@ mod tests {
         assert!(last.sfnn_freeze_l1);
         assert_eq!(last.batches_per_update, 4);
         assert_eq!(resume_signature(&first), resume_signature(&last));
-        assert_eq!(effective_batches_per_superbatch(&first).unwrap(), effective_batches_per_superbatch(&last).unwrap());
+        assert_eq!(effective_batches_per_superbatch(&first).unwrap(), 610);
+        assert_eq!(effective_batches_per_superbatch(&last).unwrap(), 608);
         assert_eq!(effective_batches_per_superbatch(&last).unwrap() % 4, 0);
         #[cfg(feature = "cuda-cpp-backend")]
         {
@@ -27187,6 +27192,120 @@ mod tests {
             assert!((e11.lr_start - 0.0002).abs() < 1e-8);
             assert!((e11.lr_end - 0.00002).abs() < 1e-8);
         }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn future_epoch_settings_do_not_change_training_prefix() {
+        for lr_kind in ["step", "cos", "geometric"] {
+            let base = Args::try_parse_from(["bulletou", "--teacher", "/dev/null",
+                "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--superbatches", "3",
+                "--max-epochs", "10", "--positions-per-superbatch", "40000000",
+                "--optimizer-weight-clip", "1.9", "--lr-schedule", lr_kind]).unwrap();
+            let plain = cuda_cpp_run_schedule(&base).unwrap();
+            let mut future = base.clone();
+            future.epoch_settings_json = Some(serde_json::json!({
+                "lr": {"epoch1": base.lr, "epoch11": 0.0001},
+                "lr_min": {"epoch1": base.lr_min, "epoch11": 0.00001},
+                "batches_per_update": {"epoch1": 1, "epoch11": 4},
+                "sfnn_qat_l1": {"epoch1": base.sfnn_qat_l1, "epoch11": true},
+                "sfnn_freeze_l1": {"epoch1": false, "epoch11": true},
+                "sfnn_l1_lr_mult": {"epoch1": base.sfnn_l1_lr_mult, "epoch11": 0.1},
+                "sfnn_norm_loss_strength": {"epoch1": base.sfnn_norm_loss_strength, "epoch11": 0.001},
+                "sfnn_saturation_penalty": {"epoch1": base.sfnn_saturation_penalty, "epoch11": 0.00001},
+                "sfnn_saturation_threshold": {"epoch1": base.sfnn_saturation_threshold, "epoch11": 0.9},
+                "optimizer_weight_clip": {"epoch1": base.optimizer_weight_clip, "epoch11": 1.0},
+                "optimizer_weight_decay": {"epoch1": base.optimizer_weight_decay, "epoch11": 0.01},
+                "bce_error_weight_k": {"epoch1": base.bce_error_weight_k, "epoch11": 2.0}
+            }).to_string());
+            // Check both an unexecuted future epoch and a future epoch in this run.
+            for max_epochs in [10, 12] {
+                future.max_epochs = Some(max_epochs);
+                let changed = cuda_cpp_run_schedule(&future).unwrap();
+                assert_eq!(changed.batches_per_superbatch, 610);
+                assert_eq!(effective_teacher_shuffle_buffer_batches(&base, plain.batches_per_superbatch).unwrap(),
+                    effective_teacher_shuffle_buffer_batches(&future, changed.batches_per_superbatch).unwrap());
+                assert_eq!(effective_teacher_shuffle_seed(&base, plain.batches_per_superbatch),
+                    effective_teacher_shuffle_seed(&future, changed.batches_per_superbatch));
+                for epoch in 1..=10 {
+                    let active = args_at_epoch(&future, epoch).unwrap();
+                    assert_eq!(active.sfnn_qat_l1, base.sfnn_qat_l1);
+                    assert_eq!(active.sfnn_freeze_l1, base.sfnn_freeze_l1);
+                    assert_eq!(active.sfnn_l1_lr_mult, base.sfnn_l1_lr_mult);
+                    assert_eq!(active.sfnn_norm_loss_strength, base.sfnn_norm_loss_strength);
+                    assert_eq!(active.sfnn_saturation_penalty, base.sfnn_saturation_penalty);
+                    assert_eq!(active.sfnn_saturation_threshold, base.sfnn_saturation_threshold);
+                    assert_eq!(active.optimizer_weight_clip, base.optimizer_weight_clip);
+                    assert_eq!(active.optimizer_weight_decay, base.optimizer_weight_decay);
+                }
+                for step in 0..plain.total_steps {
+                    let progress = plain.progress_for_step(step + 1).unwrap();
+                    assert_eq!(Some(progress), changed.progress_for_step(step + 1));
+                    let active = args_at_epoch(&future, progress.epoch).unwrap();
+                    assert_eq!(cuda_cpp_scalar_loss_kind(&base), cuda_cpp_scalar_loss_kind(&active));
+                    assert_eq!(plain.lr_for_step(&base, step, effective_batch_size(&base)),
+                        changed.lr_for_step(&active, step, effective_batch_size(&active)));
+                }
+                if max_epochs == 12 {
+                    let progress = changed.progress_for_step(plain.total_steps + 1).unwrap();
+                    assert_eq!((progress.epoch, progress.superbatch, progress.batch_in_superbatch), (11, 1, 1));
+                    assert_eq!((progress.batches_per_superbatch, progress.batches_per_update), (608, 4));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn scheduled_bpu_uses_epoch_local_update_boundaries() {
+        let mut args = Args::try_parse_from(["bulletou", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--superbatches", "1",
+            "--max-epochs", "2", "--batch-size", "64", "--positions-per-superbatch", "384"]).unwrap();
+        args.epoch_settings_json = Some(serde_json::json!({
+            "batches_per_update": {"epoch1": 1, "epoch2": 4}
+        }).to_string());
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert_eq!(schedule.total_steps, 10); // 6 batches, then 4 (not globally rounded to 4).
+        let updates: Vec<_> = (7..=10).filter(|&seen| {
+            let p = schedule.progress_for_step(seen).unwrap();
+            p.batch_in_superbatch % p.batches_per_update == 0
+        }).collect();
+        assert_eq!(updates, vec![10]); // Not global step 8.
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn scheduled_bpu_resume_uses_resumed_epoch_geometry_and_lr() {
+        let tmp = std::env::temp_dir().join(format!("bulletou-epoch-bpu-resume-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut args = Args::try_parse_from(["bulletou", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--superbatches", "3",
+            "--max-epochs", "2", "--batch-size", "64", "--positions-per-superbatch", "384",
+            "--output", tmp.to_str().unwrap()]).unwrap();
+        args.epoch_settings_json = Some(serde_json::json!({
+            "lr": {"epoch1": 0.001, "epoch2": 0.0001},
+            "lr_min": {"epoch1": 0.0001, "epoch2": 0.00001},
+            "batches_per_update": {"epoch1": 1, "epoch2": 4}
+        }).to_string());
+        let mut full = cuda_cpp_run_schedule(&args).unwrap();
+        std::fs::create_dir_all(tmp.join("0001")).unwrap();
+        write_resume_config(&tmp, &args).unwrap();
+        std::fs::write(tmp.join("0001/state.bin"), b"state").unwrap();
+        std::fs::write(tmp.join("0001/dataloader_pos.txt"), "1408,0\n").unwrap();
+        std::fs::write(tmp.join("0001/learn.log"), format!(
+            "{LEARN_LOG_HEADER}\nSFNN_HALFKA2-SFNN_halfka2_1024_8_64_k3k3,2,1,1,-,-,-,-,0.0001,0.0001,1.0,1408,/dev/null\n")).unwrap();
+        let mut resumed = cuda_cpp_run_schedule(&args).unwrap();
+        assert_eq!(resumed.batches_per_superbatch, 4);
+        assert_eq!(resumed.batches_per_update, 4);
+        assert_eq!(resumed.total_steps, 8);
+        let active = args_at_epoch(&args, 2).unwrap();
+        full.lr_step_gamma = effective_lr_step_gamma(&active, 4).unwrap().0;
+        resumed.lr_step_gamma = full.lr_step_gamma;
+        for step in 0..8 {
+            assert_eq!(resumed.progress_for_step(step + 1), full.progress_for_step(22 + step + 1));
+            assert_eq!(resumed.lr_for_step(&active, step, 64), full.lr_for_step(&active, 22 + step, 64));
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]

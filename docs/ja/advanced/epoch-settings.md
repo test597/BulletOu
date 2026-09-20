@@ -40,8 +40,10 @@ SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epoch�
 
 ## bpu変更時の丸め
 
-保存時に未反映の累積勾配を残さないため、全epoch共通のbatches/sbを、指定された全bpuの最小公倍数で割り切れる数に切り下げます。
+保存時に未反映の累積勾配を残さないため、batches/sbは**そのepochで有効なbpuだけ**で割り切れる数に切り下げます。将来のepochの設定は、現在のbatch数・LR周期・勾配更新境界に影響しません。
 
-40M局面/sb・batch size 65,536・bpu 1→4なら、全epochで608 batches/sb（39,845,888局面）です。bpu=1固定時の610とはわずかに異なります。再開時にbpuの集合を変更した場合も起動時のbatches/sb表示を確認してください。
+40M局面/sb・batch size 65,536・bpuをepoch1=1、epoch11=4とした場合、epoch1〜10は610 batches/sb（39,976,960局面）、epoch11以降は608 batches/sb（39,845,888局面）です。max_epochs=5なら、epoch11の指定による丸めは一切ありません。
+
+教師shuffleの窓幅は起動時に有効な設定で決まり、同じ実行中には変更しません。将来のbpuを参照して窓幅を変えることもありません。設定全体の構文検査と実行予定の作成は起動時に行いますが、将来の設定値を現在の学習計算に適用しません。
 
 [Grid search](grid-search.md) / [English](../../en/advanced/epoch-settings.md)
