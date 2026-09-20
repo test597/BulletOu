@@ -17070,6 +17070,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     use bulletou_lib::value::SfnnTeacherBatchConfig;
 
     let mut schedule = cuda_cpp_run_schedule(args)?;
+    let starting_args = args_at_epoch(args, schedule.chunks.first().map(|c| c.epoch).unwrap_or(1))?;
+    let args = &starting_args;
+    schedule.batches_per_update = args.batches_per_update;
     let train_steps = schedule.total_steps;
     let batch_size = effective_batch_size(args);
     let teacher_shuffle_buffer_batches =
