@@ -153,7 +153,43 @@ def positive_int(settings: dict, key: str) -> int:
     return value
 
 
+EPOCH_SETTING_KEYS = {
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1",
+    "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
+    "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
+    "bce_error_weight_k",
+}
+
+
+def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
+    resolved = dict(settings)
+    for key, value in settings.items():
+        if not isinstance(value, dict):
+            continue
+        if key not in EPOCH_SETTING_KEYS:
+            raise ValueError(f"epoch schedule is not supported for {key}")
+        if "epoch1" not in value:
+            raise ValueError(f"{key}: epoch schedule requires epoch1")
+        for name, item in value.items():
+            if not re.fullmatch(r"epoch[1-9][0-9]*", name):
+                raise ValueError(f"{key}: invalid epoch key {name!r}")
+            if key in ("sfnn_qat_l1", "sfnn_freeze_l1"):
+                if type(item) is not bool:
+                    raise ValueError(f"{key}.{name} must be true/false")
+            elif type(item) not in (int, float) or not math.isfinite(item):
+                raise ValueError(f"{key}.{name} must be a finite number")
+        name = max((n for n in value if int(n[5:]) <= epoch), key=lambda n: int(n[5:]))
+        resolved[key] = value[name]
+    return resolved
+
+
 def check_settings(settings: dict) -> None:
+    if any(isinstance(v, dict) for v in settings.values()):
+        resolve_epoch_settings(settings, 1)  # Validate keys/types before parsing boundaries.
+        boundaries = {1} | {int(n[5:]) for v in settings.values() if isinstance(v, dict) for n in v}
+        for epoch in sorted(boundaries):
+            check_settings(resolve_epoch_settings(settings, epoch))
+        return
     for key, value in settings.items():
         scalar(value)
         if key == "settings_file":
@@ -207,7 +243,7 @@ def make_plan(args) -> dict:
         key = key_name(raw_key)
         if key in template:
             raise ValueError(f"duplicate normalized setting: {key}")
-        template[key] = scalar(value)
+        template[key] = value if isinstance(value, dict) else scalar(value)
     for key in OUTPUT_KEYS:
         template.pop(key, None)
     if args.checkpoint:
@@ -536,6 +572,8 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
     parameter_columns = [key for key in parameter_columns
                          if any(key in settings for settings in all_settings)]
     parameter_columns = list(dict.fromkeys([*parameter_columns, *changed_setting_columns(plan)]))
+    parameter_columns = list(dict.fromkeys([*parameter_columns,
+        *(key for settings in all_settings for key, value in settings.items() if isinstance(value, dict))]))
     fields = ["trial", "epoch", "superbatch", *METRICS, *EXTREMA,
               *[name + "_sb" for name in EXTREMA], "positions",
               *parameter_columns, "status", "trial_status", "output_dir", "checkpoint"]
@@ -557,7 +595,7 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
                 continue  # Unselected conditions were not extended.
             group = [row for row in rows if int(row["epoch"]) == epoch]
             last = group[-1] if group else {}
-            settings = epoch_settings(trial, epoch, group)
+            settings = resolve_epoch_settings(epoch_settings(trial, epoch, group), epoch)
             closed = last and int(last["superbatch"]) == settings["superbatches"]
             row = {key: settings.get(key, "") for key in parameter_columns}
             if not closed:

@@ -14,6 +14,37 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_epoch_settings_numeric_boolean_inheritance_and_validation(self):
+        settings = {**self.common,
+                    "lr": {"epoch1": 0.0004, "epoch11": 0.0002},
+                    "sfnn_qat_l1": {"epoch1": True, "epoch11": False},
+                    "batches_per_update": {"epoch1": 1, "epoch11": 4}}
+        grid.check_settings(settings)
+        for epoch in (1, 2, 10, 11, 15):
+            resolved = grid.resolve_epoch_settings(settings, epoch)
+            self.assertEqual(resolved["lr"], 0.0004 if epoch < 11 else 0.0002)
+            self.assertEqual(resolved["sfnn_qat_l1"], epoch < 11)
+        for key, value in [("arch", {"epoch1": "foo"}), ("lr", {"epoch2": .001}),
+                           ("lr", {"epoch1": .001, "epoch02": .001}),
+                           ("sfnn_qat_l1", {"epoch1": 1}),
+                           ("lr", {"epoch1": .001, "epoch2": -1})]:
+            with self.assertRaises(ValueError):
+                grid.check_settings({**self.common, key: value})
+
+    def test_epoch_settings_grid_override_and_summary(self):
+        settings = {**self.common, "lr": {"epoch1": .0004, "epoch2": .0002},
+                    "sfnn_qat_l1": {"epoch1": True, "epoch2": False}}
+        grid.atomic_json(self.settings_path, settings)
+        plan = self.plan()
+        self.assertEqual(plan["trials"][0]["settings"]["lr"], .0001)  # explicit axis wins
+        args = grid.parse_args(["--settings-file", str(self.settings_path), "--output-folder", str(self.output),
+                               "--grid", "wrm_target_offset", "0"])
+        plan = grid.make_plan(args)
+        self.complete_plan(plan)
+        _, rows = grid.summarize(self.output, plan)
+        self.assertEqual([r["lr"] for r in rows], [.0004, .0002])
+        self.assertEqual([r["sfnn_qat_l1"] for r in rows], [True, False])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -4048,10 +4048,86 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
     let root =
         root.as_object().ok_or_else(|| format!("--settings-file {} must contain a JSON object", path.display()))?;
     let mut out = Vec::new();
+    let mut schedules = serde_json::Map::new();
     for (key, value) in root {
-        bulletou_settings_json_value_to_args(path, key, value, &mut out)?;
+        if value.is_object() {
+            let key = key.replace('-', "_");
+            validate_epoch_setting(&key, value)?;
+            bulletou_settings_json_value_to_args(path, &key, epoch_setting_value(value, 1)?, &mut out)?;
+            schedules.insert(key, value.clone());
+        } else {
+            bulletou_settings_json_value_to_args(path, key, value, &mut out)?;
+        }
+    }
+    if !schedules.is_empty() {
+        out.push("--epoch-settings-json".into());
+        out.push(serde_json::Value::Object(schedules).to_string().into());
     }
     Ok(out)
+}
+
+const EPOCH_SETTING_KEYS: &[&str] = &[
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1",
+    "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
+    "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
+    "bce_error_weight_k",
+];
+
+fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    if !EPOCH_SETTING_KEYS.contains(&key) {
+        return Err(format!("epoch schedule is not supported for `{key}`; supported: {}", EPOCH_SETTING_KEYS.join(", ")));
+    }
+    let map = value.as_object().ok_or("epoch schedule must be an object")?;
+    if !map.contains_key("epoch1") {
+        return Err(format!("epoch schedule `{key}` requires epoch1"));
+    }
+    for (name, v) in map {
+        let epoch = name.strip_prefix("epoch").and_then(|s| s.parse::<usize>().ok()).filter(|&e| e > 0);
+        if epoch.is_none() || name != &format!("epoch{}", epoch.unwrap()) {
+            return Err(format!("invalid epoch key `{name}` in `{key}`; use epoch1, epoch2, ..."));
+        }
+        let boolean = matches!(key, "sfnn_qat_l1" | "sfnn_freeze_l1");
+        if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
+            return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
+        }
+    }
+    Ok(())
+}
+
+fn epoch_setting_value(value: &serde_json::Value, epoch: usize) -> Result<&serde_json::Value, String> {
+    value.as_object().ok_or("epoch schedule must be an object")?.iter()
+        .filter_map(|(key, value)| key.strip_prefix("epoch")?.parse::<usize>().ok().map(|e| (e, value)))
+        .filter(|(e, _)| *e <= epoch).max_by_key(|(e, _)| *e).map(|(_, value)| value)
+        .ok_or_else(|| format!("epoch schedule has no value at epoch {epoch}"))
+}
+
+fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
+    let mut resolved = args.clone();
+    let Some(json) = args.epoch_settings_json.as_ref() else { return Ok(resolved); };
+    let schedules: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).map_err(|e| format!("invalid epoch settings: {e}"))?;
+    for (key, schedule) in &schedules {
+        validate_epoch_setting(key, schedule)?;
+        let value = epoch_setting_value(schedule, epoch)?;
+        macro_rules! assign {
+            ($($field:ident),* $(,)?) => { match key.as_str() {
+                $(stringify!($field) => resolved.$field = serde_json::from_value(value.clone())
+                    .map_err(|e| format!("{key} at epoch {epoch}: {e}"))?,)*
+                _ => unreachable!(),
+            }};
+        }
+        assign!(lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1,
+            sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
+            sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
+    }
+    if !resolved.lr.is_finite() || !resolved.lr_min.is_finite() || resolved.lr <= 0.0
+        || resolved.lr_min <= 0.0 || resolved.lr_min > resolved.lr || resolved.batches_per_update == 0 {
+        return Err(format!("invalid epoch {epoch} settings: require lr >= lr_min > 0 and batches_per_update > 0"));
+    }
+    if !resolved.optimizer_weight_decay.is_finite() || resolved.optimizer_weight_decay < 0.0 {
+        return Err(format!("epoch {epoch}: optimizer_weight_decay must be finite and >= 0"));
+    }
+    resolved.validate_arch_flags()?;
+    Ok(resolved)
 }
 
 fn find_settings_file_arg(raw_args: &[std::ffi::OsString]) -> Result<Option<std::path::PathBuf>, String> {
@@ -4085,7 +4161,19 @@ fn expand_settings_file_args(raw_args: Vec<std::ffi::OsString>) -> Result<Vec<st
     let Some(settings_path) = find_settings_file_arg(&raw_args)? else {
         return Ok(raw_args);
     };
-    let settings_args = bulletou_settings_json_args(&settings_path)?;
+    let mut settings_args = bulletou_settings_json_args(&settings_path)?;
+    // An explicitly supplied CLI scalar overrides its entire JSON schedule.
+    if let Some(index) = settings_args.iter().position(|v| v == "--epoch-settings-json") {
+        let mut schedules: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&settings_args[index + 1].to_string_lossy()).map_err(|e| e.to_string())?;
+        for arg in raw_args.iter().skip(1) {
+            if let Some(flag) = arg.to_string_lossy().strip_prefix("--") {
+                schedules.remove(&flag.split('=').next().unwrap_or(flag).replace('-', "_"));
+            }
+        }
+        if schedules.is_empty() { settings_args.drain(index..index + 2); }
+        else { settings_args[index + 1] = serde_json::Value::Object(schedules).to_string().into(); }
+    }
     let mut expanded = Vec::with_capacity(raw_args.len() + settings_args.len());
     if let Some(program) = raw_args.first() {
         expanded.push(program.clone());
@@ -4210,7 +4298,21 @@ fn effective_batches_per_superbatch(args: &Args) -> Result<usize, String> {
         return Err("--batch-size must be > 0.".to_string());
     }
     let raw_batches = args.positions_per_superbatch / batch_size;
-    let batches_per_update = args.batches_per_update.max(1);
+    let mut batches_per_update = args.batches_per_update.max(1);
+    // Keep SB geometry constant across resume/epoch changes, and never save
+    // with a partially accumulated update. Round to the LCM of scheduled BPUs.
+    if let Some(json) = args.epoch_settings_json.as_ref() {
+        let schedules: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if let Some(values) = schedules.get("batches_per_update").and_then(|v| v.as_object()) {
+            for value in values.values() {
+                let n: usize = serde_json::from_value(value.clone()).map_err(|e| format!("batches_per_update: {e}"))?;
+                if n == 0 { return Err("batches_per_update must be > 0".into()); }
+                let (mut a, mut b) = (batches_per_update, n);
+                while b != 0 { (a, b) = (b, a % b); }
+                batches_per_update = (batches_per_update / a).checked_mul(n).ok_or("scheduled BPU alignment overflow")?;
+            }
+        }
+    }
     let batches = raw_batches - (raw_batches % batches_per_update);
     if batches == 0 {
         if batches_per_update == 1 {
@@ -4357,6 +4459,8 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
     after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  export-nn16                Export FP32 SFNN state.bin with int16 L1/L2/L3 weights (default QB=4096)\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  progress-train             Train a shared 0..255 SFNN progress classifier from complete .pack games\n  export-progress-bin        Extract SFNN progress parameters from state.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
+    #[arg(long, hide = true)]
+    epoch_settings_json: Option<String>,
     /// Read BulletOu training options from a JSON file. Keys use snake_case
     /// names matching the CLI options without leading `--`, e.g.
     /// `lr_min` -> `--lr-min`. Command-line arguments written explicitly
@@ -10244,6 +10348,9 @@ struct WorkerSfnnSession {
 #[cfg(feature = "cuda-cpp-backend")]
 impl WorkerSfnnSession {
     fn open(args: Args) -> Result<Self, String> {
+        if args.epoch_settings_json.is_some() {
+            return Err("epoch schedules are supported by standalone SFNN training/grid_search, not worker mode".into());
+        }
         print_sfnn_qat_mode(&args);
         if args.lr_schedule == LrScheduleKind::Plateau {
             return Err("worker train-session does not support --lr-schedule plateau yet".to_string());
@@ -16962,7 +17069,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     };
     use bulletou_lib::value::SfnnTeacherBatchConfig;
 
-    let schedule = cuda_cpp_run_schedule(args)?;
+    let mut schedule = cuda_cpp_run_schedule(args)?;
     let train_steps = schedule.total_steps;
     let batch_size = effective_batch_size(args);
     let teacher_shuffle_buffer_batches =
@@ -17914,10 +18021,30 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         if args.sfnn_dirty_bucket_update { vec![false; cuda_shape.num_stacks] } else { Vec::new() };
     let mut dirty_buckets = Vec::<i32>::new();
     let mut hard_progress_buckets = if frozen_progress_params.is_some() { vec![0; batch_size] } else { Vec::new() };
+    let base_args = args;
+    let mut epoch_args = args.clone();
+    let mut active_epoch = None;
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
         last_dataloader_pos = teacher_batch.dataloader_pos;
-        let progress_for_step = schedule.progress_for_step(seen_steps);
+        let mut progress_for_step = schedule.progress_for_step(seen_steps);
+        if let Some(progress) = progress_for_step.as_mut() {
+            if active_epoch != Some(progress.epoch) && base_args.epoch_settings_json.is_some() {
+                ctx.synchronize().map_err(|e| e.to_string())?;
+                epoch_args = args_at_epoch(base_args, progress.epoch)?;
+                schedule.batches_per_update = epoch_args.batches_per_update;
+                schedule.lr_step_gamma = effective_lr_step_gamma(&epoch_args, schedule.batches_per_superbatch)?.0;
+                let changes: serde_json::Map<String, serde_json::Value> = serde_json::from_str(base_args.epoch_settings_json.as_ref().unwrap()).map_err(|e| e.to_string())?;
+                let resolved: serde_json::Map<String, serde_json::Value> = changes.iter()
+                    .map(|(key, value)| Ok((key.clone(), epoch_setting_value(value, progress.epoch)?.clone())))
+                    .collect::<Result<_, String>>()?;
+                eprintln!("  [epoch settings] epoch={} {}", progress.epoch, serde_json::Value::Object(resolved));
+                active_epoch = Some(progress.epoch);
+            }
+            progress.batches_per_update = schedule.batches_per_update;
+        }
+        let args = &epoch_args;
+        let loss_kind = cuda_cpp_scalar_loss_kind(args);
         print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, args.max_epochs);
         sfnn_diagnostics.observe_teacher(teacher_batch.timing);
         let batches_per_update = args.batches_per_update;
@@ -18397,6 +18524,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     })
     .map_err(|e| e.to_string())?;
 
+    let args = &epoch_args;
     ctx.synchronize().map_err(|e| e.to_string())?;
     let elapsed = started.elapsed().as_secs_f64();
     let positions = seen_steps.saturating_mul(batch_size);
@@ -24513,6 +24641,10 @@ fn append_cuda_cpp_progress_log(
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
+    if args.epoch_settings_json.is_some() && (!args.eval_type().uses_layerstack()
+        || args.cuda_cpp_train_steps.is_some() || args.lr_schedule == LrScheduleKind::Plateau) {
+        return Err("epoch settings require standalone SFNN production training with step/cos/geometric LR".into());
+    }
     let batch_size = effective_batch_size(args);
     let batches_per_update = args.batches_per_update.max(1);
     let default_lr_step_positions = effective_lr_step_positions(args, 1);
@@ -24642,6 +24774,16 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         quantized_validation_enabled && quantized_validation_is_epoch_end_only(args);
     let save_epoch_end = effective_save_epoch_end(args);
     for epoch in start_epoch..=max_epochs {
+        let epoch_args = args_at_epoch(args, epoch)?;
+        let args = &epoch_args;
+        let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)?.0;
+        if args.epoch_settings_json.is_some() {
+            let epoch_batches = superbatches.checked_mul(batches_per_superbatch).ok_or("epoch batch count overflow")?;
+            if epoch_batches % args.batches_per_update != 0
+                || (epoch == start_epoch && (first_epoch_start_superbatch - 1) * batches_per_superbatch % args.batches_per_update != 0) {
+                return Err(format!("epoch {epoch}: batches_per_update={} must divide epoch batches ({epoch_batches}) and the resume batch offset; no accumulated gradients may cross epoch boundaries", args.batches_per_update));
+            }
+        }
         let mut first_superbatch = if epoch == start_epoch { first_epoch_start_superbatch } else { 1 };
         while first_superbatch <= superbatches {
             let save_boundary = save_period_sbs.map(|rate| next_superbatch_rate_boundary(first_superbatch, rate));
@@ -24903,6 +25045,17 @@ const RESUME_CONFIG_NAME: &str = "resume-config.txt";
 /// changing controls such as `--superbatches` or LR policy should require an
 /// explicit `--resume`.
 fn resume_signature(args: &Args) -> String {
+    // The signature identifies the run, not whichever scheduled value happened
+    // to be active when its last checkpoint was saved.
+    if args.epoch_settings_json.is_some() {
+        if let Ok(initial) = args_at_epoch(args, 1) {
+            return format!("{}epoch_settings={}\n", resume_signature_values(&initial), args.epoch_settings_json.as_ref().unwrap());
+        }
+    }
+    resume_signature_values(args)
+}
+
+fn resume_signature_values(args: &Args) -> String {
     let positions_per_superbatch = effective_positions_per_superbatch(args).unwrap_or(DEFAULT_POSITIONS_PER_SUPERBATCH);
     let batches_per_superbatch = effective_batches_per_superbatch(args).unwrap_or(1);
     let lr_step_gamma =
@@ -26995,6 +27148,65 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::str::FromStr;
+
+    #[test]
+    fn epoch_settings_values_false_and_signature() {
+        let mut args = Args::try_parse_from(["bulletou", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--superbatches", "2", "--max-epochs", "12"]).unwrap();
+        args.epoch_settings_json = Some(serde_json::json!({
+            "lr": {"epoch1": 0.0004, "epoch11": 0.0002},
+            "lr_min": {"epoch1": 0.00005, "epoch11": 0.00002},
+            "sfnn_qat_l1": {"epoch1": true, "epoch11": false},
+            "sfnn_freeze_l1": {"epoch1": false, "epoch11": true},
+            "batches_per_update": {"epoch1": 1, "epoch11": 4}
+        }).to_string());
+        let first = args_at_epoch(&args, 1).unwrap();
+        let tenth = args_at_epoch(&args, 10).unwrap();
+        let last = args_at_epoch(&args, 12).unwrap();
+        assert_eq!(first.lr, tenth.lr);
+        assert_eq!(last.lr, 0.0002);
+        assert!(first.sfnn_qat_l1);
+        assert!(!last.sfnn_qat_l1);
+        assert!(last.sfnn_freeze_l1);
+        assert_eq!(last.batches_per_update, 4);
+        assert_eq!(resume_signature(&first), resume_signature(&last));
+        assert_eq!(effective_batches_per_superbatch(&first).unwrap(), effective_batches_per_superbatch(&last).unwrap());
+        assert_eq!(effective_batches_per_superbatch(&last).unwrap() % 4, 0);
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            assert!(cuda_cpp_sfnn_layer_lr_multipliers(&first, None).qat_l1);
+            assert!(!cuda_cpp_sfnn_layer_lr_multipliers(&last, None).qat_l1);
+            assert_eq!(cuda_cpp_sfnn_layer_lr_multipliers(&last, None).l1, 0.0);
+            let schedule = cuda_cpp_run_schedule(&first).unwrap();
+            let e1 = schedule.chunks.iter().find(|c| c.epoch == 1).unwrap();
+            let e11 = schedule.chunks.iter().find(|c| c.epoch == 11).unwrap();
+            assert!((e1.lr_start - 0.0004).abs() < 1e-8);
+            assert!((e11.lr_start - 0.0002).abs() < 1e-8);
+            assert!((e11.lr_end - 0.00002).abs() < 1e-8);
+        }
+    }
+
+    #[test]
+    fn epoch_settings_file_and_cli_override() {
+        let path = std::env::temp_dir().join(format!("epoch-settings-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"teacher":"/dev/null","arch":"SFNN_halfka2_1024_8_64_k3k3","lr":{"epoch1":0.0004,"epoch11":0.0002},"sfnn_qat_l1":{"epoch1":true,"epoch11":false}}"#).unwrap();
+        let raw = vec![OsString::from("bulletou"), OsString::from("--settings-file"), path.clone().into_os_string()];
+        let parsed = Args::try_parse_from(expand_settings_file_args(raw.clone()).unwrap()).unwrap();
+        assert_eq!(args_at_epoch(&parsed, 15).unwrap().lr, 0.0002);
+        let mut override_args = raw;
+        override_args.extend([OsString::from("--lr"), OsString::from("0.0003")]);
+        let parsed = Args::try_parse_from(expand_settings_file_args(override_args).unwrap()).unwrap();
+        assert_eq!(args_at_epoch(&parsed, 15).unwrap().lr, 0.0003);
+        assert!(!args_at_epoch(&parsed, 15).unwrap().sfnn_qat_l1);
+        std::fs::remove_file(path).unwrap();
+        for (key, value) in [
+            ("arch", serde_json::json!({"epoch1": "bad"})),
+            ("lr", serde_json::json!({"epoch0": 1, "epoch1": 1})),
+            ("lr", serde_json::json!({"epoch2": 1})),
+            ("lr", serde_json::json!({"epoch1": 1, "epoch02": 2})),
+            ("sfnn_qat_l1", serde_json::json!({"epoch1": 1})),
+        ] { assert!(validate_epoch_setting(key, &value).is_err()); }
+    }
 
     #[test]
     fn wrm_target_epsilon_cli_validation() {

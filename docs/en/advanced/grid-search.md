@@ -1,5 +1,7 @@
 # Compare training conditions with grid search
 
+The common JSON supports [per-epoch settings](epoch-settings.md), such as `"lr": {"epoch1": 0.0004, "epoch11": 0.0002}`, including boolean transitions for QAT. The CSV records effective values for each epoch.
+
 `grid_summary.csv` updates **after each completed epoch during training**, as well as at trial start, exit, and interruption. The runner checks the trainer's `summary-learn.csv` approximately once per second, without waiting for more stdout or the whole trial to finish. In a ten-epoch trial, epoch 1 results therefore appear as soon as they are complete. Unfinished epochs retain blank metric cells; `--epochs` still controls which epochs are reported. Partial source records and temporarily locked output files produce a warning and are retried without stopping training.
 
 Use `--grid loss_bce_with_logits false true` to compare squared error with BCE. Set the common `wrm_in_offset` to0 and disable explicit `win_rate_model` / `loss_sigmoid_mse` flags. See [BCE formulas and caveats](bce-with-logits.md).
