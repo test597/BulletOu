@@ -316,6 +316,22 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(len(result), 4)
         self.assertEqual(rows[-1]["quantized_value_accuracy"], "-")
 
+    def test_summary_omits_final_sb_lr_but_keeps_configured_lr(self):
+        plan = self.plan()
+        trial = plan["trials"][0]
+        directory = grid.trial_dir(self.output, trial)
+        self.summary(directory, [{**self.metrics(), "lr_start": "0.000015", "lr_end": "0.000014"}])
+        source = (directory / grid.SUMMARY_CSV_NAME).read_bytes()
+        path = self.output / "grid_summary.csv"
+        grid.write_summary(self.output, plan, path)
+        rows = self.csv_rows(path)
+        for row in rows:
+            self.assertNotIn("lr_start", row)
+            self.assertNotIn("lr_end", row)
+        self.assertEqual(float(rows[0]["lr"]), trial["settings"]["lr"])
+        self.assertEqual(float(rows[0]["lr_min"]), trial["settings"]["lr_min"])
+        self.assertEqual((directory / grid.SUMMARY_CSV_NAME).read_bytes(), source)
+
     def test_unsaved_peak_no_invented_checkpoint(self):
         plan = self.plan()
         directory = grid.trial_dir(self.output, plan["trials"][0])

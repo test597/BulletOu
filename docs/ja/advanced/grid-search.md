@@ -134,7 +134,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 | `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` | **acc → loss → qacc → qloss**。そのepochの最後の行の値。accuracyは0～1 |
 | `max_acc`, `min_loss`, `max_qacc`, `min_qloss` | そのepochで実際に計測された値の最大／最小。4指標は別々のsbで達成していてもよい |
 | `max_acc_sb`, `min_loss_sb`, `max_qacc_sb`, `min_qloss_sb` | 各最大／最小のsb。同値なら最初のsb |
-| `positions`, `lr_start`, `lr_end` | 本体の最後の行の局面数とLR。`lr_start` はepoch先頭とは限らず、その行の区間の先頭 |
+| `positions` | 本体の最後の行の累積局面数。最終sbの `lr_start` / `lr_end` は集計に出しません。設定値の `lr` / `lr_min` は条件列に残します |
 | `lr`, `lr_min`, `wrm_target_scaling` 等 | 指定した学習条件。grid軸は個別列になる。JSONにない既定値を推測で埋めない |
 | `status` | epoch完了は `done`。未完了は `pending` / `running` / `interrupted` / `failed` / `incomplete`。`trial_status`はtrial全体の状態なので異なる場合があります |
 | `trial_status` | 条件全体の実行状態。経過時間 `elapsed_seconds` は集計CSVには出力しない |

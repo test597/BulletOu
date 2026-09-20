@@ -537,7 +537,7 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
                          if any(key in settings for settings in all_settings)]
     parameter_columns = list(dict.fromkeys([*parameter_columns, *changed_setting_columns(plan)]))
     fields = ["trial", "epoch", "superbatch", *METRICS, *EXTREMA,
-              *[name + "_sb" for name in EXTREMA], "positions", "lr_start", "lr_end",
+              *[name + "_sb" for name in EXTREMA], "positions",
               *parameter_columns, "status", "trial_status", "output_dir", "checkpoint"]
     # Generic grid keys must not duplicate metric/status columns.
     fields = list(dict.fromkeys(fields))
@@ -571,7 +571,7 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
                        status=status, trial_status=trial_status,
                        output_dir=str(directory),
                        checkpoint=checkpoint_path(directory, last))
-            for key in (*METRICS, "positions", "lr_start", "lr_end"):
+            for key in (*METRICS, "positions"):
                 value = last.get(key, "")
                 row[key] = value if numeric(value) is not None else ""
             for metric, name in zip(METRICS, EXTREMA):

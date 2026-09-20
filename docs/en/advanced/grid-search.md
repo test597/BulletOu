@@ -134,7 +134,7 @@ One row represents **one condition × one reported epoch**:
 | `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` | **acc, loss, qacc, qloss**, in that order, from the last row in the epoch. Accuracy is a 0–1 fraction |
 | `max_acc`, `min_loss`, `max_qacc`, `min_qloss` | Independently measured epoch extrema, possibly from different sb |
 | Corresponding `*_sb` columns | Location of each extremum; first sb on ties |
-| `positions`, `lr_start`, `lr_end` | Last native row's position count and LR interval. `lr_start` need not be the epoch-start LR |
+| `positions` | Cumulative position count from the last native row. Final-sb `lr_start` / `lr_end` are omitted; configured `lr` / `lr_min` remain in the condition columns |
 | `lr`, `lr_min`, `wrm_target_scaling`, etc. | Settings, including individual grid-axis columns. Unspecified executable defaults are not guessed |
 | `status` | `done` for a completed epoch; otherwise `pending`, `running`, `interrupted`, `failed` or `incomplete`. This may differ from the overall `trial_status` |
 | `trial_status` | Whole-condition state. `elapsed_seconds` is not included in the aggregate CSV |
