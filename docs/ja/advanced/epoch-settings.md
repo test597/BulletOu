@@ -31,7 +31,6 @@ SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epoch�
 | `sfnn_freeze_l1` | L1の固定・解除 |
 | `sfnn_l1_lr_mult` | L1の学習率倍率 |
 | `sfnn_norm_loss_strength` | ノルム正則化係数 |
-| `sfnn_l1_saturation_backward_alpha` | L1通常・二乗枝の上限飽和時backward係数。0～1、0は従来動作 |
 | `sfnn_saturation_penalty`, `sfnn_saturation_threshold` | 飽和penaltyの係数・閾値 |
 | `optimizer_weight_clip` | 重みclip幅（0は無効） |
 | `optimizer_weight_decay` | weight decay係数 |

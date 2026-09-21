@@ -25,21 +25,6 @@ class GridSearchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "warmup_sb"):
                 grid.check_settings({**self.common, "warmup_sb": invalid})
 
-    def test_l1_saturation_alpha_epoch_and_grid_axis(self):
-        key = "sfnn_l1_saturation_backward_alpha"
-        settings = {**self.common, key: {"epoch1": 0.0, "epoch3": 0.01}}
-        grid.check_settings(settings)
-        self.assertEqual(grid.resolve_epoch_settings(settings, 1)[key], 0.0)
-        self.assertEqual(grid.resolve_epoch_settings(settings, 3)[key], 0.01)
-        grid.atomic_json(self.settings_path, settings)
-        plan = self.plan(["--grid", key, "0", "0.001", "0.01", "0.1"])
-        self.assertEqual(len(plan["trials"]), 8)
-        self.assertEqual({t["settings"][key] for t in plan["trials"]}, {0, .001, .01, .1})
-        self.complete_plan(plan)
-        fields, rows = grid.summarize(self.output, plan)
-        self.assertIn(key, fields)
-        self.assertEqual({r[key] for r in rows}, {0, .001, .01, .1})
-
     def test_epoch_settings_numeric_boolean_inheritance_and_validation(self):
         settings = {**self.common,
                     "lr": {"epoch1": 0.0004, "epoch11": 0.0002},

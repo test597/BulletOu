@@ -50,7 +50,6 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
 COMMON_COLUMNS = (
     "arch", "lr", "lr_min", "lr_schedule", "warmup_sb", "batch_size", "batches_per_update",
     "positions_per_superbatch", "superbatches", "sfnn_factorizer",
-    "sfnn_l1_saturation_backward_alpha",
     "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "loss_bce_with_logits", "bce_error_weight_k", "wrm_nnue2score", "wrm_in_scaling",
     "wrm_target_scaling", "wrm_target_epsilon", "wrm_in_offset", "wrm_target_offset", "loss_pow_exp",
 )
@@ -157,7 +156,6 @@ def positive_int(settings: dict, key: str) -> int:
 EPOCH_SETTING_KEYS = {
     "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
-    "sfnn_l1_saturation_backward_alpha",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
 }

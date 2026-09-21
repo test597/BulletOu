@@ -18,31 +18,12 @@ python .\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260922-progress8-bceloss-16sb.json `
   --output-folder D:\BulletOu-snapshots\20260922\grid-progress8-warmup `
   --grid loss_bce_with_logits true `
-  --grid sfnn_l1_saturation_backward_alpha 0 `
   --grid lr 0.000400 `
   --grid lr_step_gamma 1.0 `
   --grid warmup_sb 0 1 4
 ```
 
-3条件の比較です。飽和時backward係数は0に固定し、warmupだけを変えます。
-
-## L1の飽和時backward係数
-
-`--sfnn-l1-saturation-backward-alpha 0.01`（JSON: `"sfnn_l1_saturation_backward_alpha": 0.01`）で、L1の上限飽和時にも近似勾配を通せます。範囲は0～1、デフォルト0は従来動作です。cuda-cppのSFNN / LayerStack用です。
-
-- 通常枝 `clamp(z,0,1)`：`z>=1`の微分をαとする。`z<=0`は従来どおり0。
-- 二乗枝 `clamp(c*z²,0,1)`、`c=127/128`：上限飽和時の微分を`α*2*c*z`とする。負のzでも符号を保つ。
-- forward、FT、L2/L3のactivation、skip枝、量子化とnn.binの推論式は変更しない。QATの丸めSTEとは別の機能。
-- 推論式の厳密な微分ではなく、上限のさらに外へ押す勾配も通る。改善を保証する機能ではない。
-- epoch別設定・worker学習にも対応。設定値はresume情報とgrid CSVに記録する。再開時の明示的な変更も可能。
-
-αの比較は、既存の共通設定・出力先に対して以下を追加します。
-
-```powershell
---grid sfnn_l1_saturation_backward_alpha 0 0.001 0.01 0.1
-```
-
-初期から32sbで比較するなら、共通JSONを`max_epochs: 1`、`superbatches: 32`、`positions_per_superbatch: 40000000`とし、継続元の指定を外してください。固定lrの試験なら`lr_schedule: "step"`で`lr`と`lr_min`を同じ値にし、lrとα以外の条件は揃えます。平均飽和率が低いだけでは単に学習が遅い可能性もあるので、lossと後続学習・棋力も確認してください。このオプション自体はユニット別の飽和統計を追加しません。
+warmupだけを変える3条件の比較です。
 
 共通JSONでは `"lr": {"epoch1": 0.0004, "epoch11": 0.0002}` のような[epoch別設定](epoch-settings.md)も使えます。QATなどのtrue/false切替にも対応し、CSVには各epochの有効値を記録します。
 
