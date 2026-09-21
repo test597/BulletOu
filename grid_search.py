@@ -48,7 +48,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
     "cuda_cpp_train_steps",
 }
 COMMON_COLUMNS = (
-    "arch", "lr", "lr_min", "lr_schedule", "batch_size", "batches_per_update",
+    "arch", "lr", "lr_min", "lr_schedule", "warmup_sb", "batch_size", "batches_per_update",
     "positions_per_superbatch", "superbatches", "sfnn_factorizer",
     "sfnn_l1_saturation_backward_alpha",
     "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "loss_bce_with_logits", "bce_error_weight_k", "wrm_nnue2score", "wrm_in_scaling",
@@ -205,6 +205,11 @@ def check_settings(settings: dict) -> None:
             raise ValueError(f"{key} must be specified in common settings")
     for key in ("max_epochs", "superbatches"):
         positive_int(settings, key)
+    warmup = settings.get("warmup_sb", 0)
+    if type(warmup) is not int or not 0 <= warmup <= settings["superbatches"]:
+        raise ValueError("warmup_sb must be an integer between 0 and superbatches")
+    if warmup and settings.get("lr_schedule", "step") == "plateau":
+        raise ValueError("warmup_sb supports step/geometric/cos, not plateau")
     test_positions = settings.get("test_positions")
     if test_positions not in (None, "all") and (type(test_positions) is not int or test_positions < 1):
         raise ValueError("test_positions must be a positive integer or 'all'; omission/null also uses all validation positions")

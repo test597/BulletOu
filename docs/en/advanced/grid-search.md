@@ -1,5 +1,31 @@
 # Compare training conditions with grid search
 
+## Initial LR warmup
+
+Set `"warmup_sb": 1` in JSON or `--warmup-sb 1` on the CLI. During **only the first SB of epoch 1**, LR rises linearly from near zero to `lr`. This is a nonnegative integer, default `0` (disabled).
+
+- Supported for cuda-cpp production step/geometric/cos schedules, including workers. Plateau and direct-step smoke mode reject nonzero warmup.
+- For optimizer update u=1..W during warmup, LR is `lr * u/W`. BPU changes do not change the requested SB duration.
+- Warmup is included in the training budget: 16 SB with 1 SB warmup leaves 15 SB for the regular schedule. An epoch entirely occupied by warmup only ramps up.
+- Automatic step gamma is recomputed for the remaining first-epoch interval. Explicit `lr_step_gamma: 1.0` keeps LR constant after warmup.
+- **Never repeats at epoch 2 or later.** Resume uses saved epoch/SB coordinates, not a fresh warmup. Separate initial-state runs and independent grid/worker trials start their own epoch 1.
+- `warmup_sb` is run-wide, not an epoch-mapped setting. It is recorded in checkpoint metadata and grid CSV.
+
+With common settings configured for 16 SB and one epoch, compare three conditions:
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260922-progress8-bceloss-16sb.json `
+  --output-folder D:\BulletOu-snapshots\20260922\grid-progress8-warmup `
+  --grid loss_bce_with_logits true `
+  --grid sfnn_l1_saturation_backward_alpha 0 `
+  --grid lr 0.000400 `
+  --grid lr_step_gamma 1.0 `
+  --grid warmup_sb 0 1 4
+```
+
+This fixes saturation backward alpha at zero and changes only warmup length.
+
 ## L1 saturation backward alpha
 
 Use `--sfnn-l1-saturation-backward-alpha 0.01`, or JSON `"sfnn_l1_saturation_backward_alpha": 0.01`, to leak approximate gradients through saturated L1 upper clamps. Range: 0–1. Default: **0 (legacy behavior)**. Supported by cuda-cpp SFNN / LayerStack training.

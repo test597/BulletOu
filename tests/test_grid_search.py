@@ -14,6 +14,17 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_warmup_sb_grid(self):
+        plan = self.plan(["--grid", "warmup_sb", "0", "1"])
+        self.assertEqual({t["settings"]["warmup_sb"] for t in plan["trials"]}, {0, 1})
+        self.complete_plan(plan)
+        fields, rows = grid.summarize(self.output, plan)
+        self.assertIn("warmup_sb", fields)
+        self.assertEqual({r["warmup_sb"] for r in rows}, {0, 1})
+        for invalid in [-1, 0.5, True]:
+            with self.assertRaisesRegex(ValueError, "warmup_sb"):
+                grid.check_settings({**self.common, "warmup_sb": invalid})
+
     def test_l1_saturation_alpha_epoch_and_grid_axis(self):
         key = "sfnn_l1_saturation_backward_alpha"
         settings = {**self.common, key: {"epoch1": 0.0, "epoch3": 0.01}}

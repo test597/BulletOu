@@ -4754,6 +4754,12 @@ struct Args {
     #[arg(long)]
     lr_step_gamma: Option<f32>,
 
+    /// Linear LR warmup during the first N superbatches of epoch 1 (0 disables).
+    /// Included in the epoch length; resumes do not restart it.
+    /// Supported by cuda-cpp production step/geometric/cos schedules, including workers.
+    #[arg(long, default_value_t = 0)]
+    warmup_sb: usize,
+
     /// Position interval for one `step` decay. If omitted, one
     /// BulletOu superbatch is used (the effective `--positions-per-superbatch`,
     /// rounded down to a multiple of `--batch-size`).
@@ -5291,6 +5297,16 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.warmup_sb > 0 {
+            if self.backend != BackendKind::CudaCpp || self.cuda_cpp_train_steps.is_some()
+                || self.lr_schedule == LrScheduleKind::Plateau
+                || self.superbatches.is_none() || self.max_epochs.is_none() {
+                return Err("--warmup-sb requires cuda-cpp production training with step/geometric/cos LR".into());
+            }
+            if self.warmup_sb > self.superbatches.unwrap() {
+                return Err("--warmup-sb must not exceed --superbatches".into());
+            }
+        }
         if self.sfnn_qat_l1 {
             if !self.eval_type().uses_layerstack() {
                 return Err("--sfnn-qat-l1 requires an SFNN arch".to_string());
@@ -24317,13 +24333,14 @@ struct CudaCppRunSchedule {
 #[cfg(feature = "cuda-cpp-backend")]
 impl CudaCppRunSchedule {
     fn lr_for_step(&self, args: &Args, step_index: usize, batch_size: usize) -> f32 {
-        if self.production && args.epoch_settings_json.is_some() {
+        if self.production && (args.epoch_settings_json.is_some() || args.warmup_sb > 0) {
             if let Some(progress) = self.progress_for_step(step_index.saturating_add(1)) {
                 let epoch_step = (progress.superbatch - 1) * progress.batches_per_superbatch
                     + progress.batch_in_superbatch - 1;
-                return cuda_cpp_lr_at_step(args, epoch_step, batch_size, 0,
+                return cuda_cpp_epoch_lr(args, progress.epoch, epoch_step, batch_size,
                     (self.superbatches_per_epoch as u64) * progress.batches_per_superbatch as u64 * batch_size as u64,
-                    self.lr_step_gamma, effective_lr_step_positions(args, progress.batches_per_superbatch));
+                    self.lr_step_gamma, effective_lr_step_positions(args, progress.batches_per_superbatch),
+                    progress.batches_per_superbatch);
             }
         }
         if self.production {
@@ -24660,6 +24677,12 @@ fn append_cuda_cpp_progress_log(
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
+    if args.warmup_sb > 0 {
+        args.validate_arch_flags()?;
+        print_startup_kv("LR warmup", format!(
+            "{} sb, epoch 1 only; linear per optimizer update to {}; included in epoch length (resume keeps progress)",
+            args.warmup_sb, args.lr));
+    }
     if args.epoch_settings_json.is_some() && (!args.eval_type().uses_layerstack()
         || args.cuda_cpp_train_steps.is_some() || args.lr_schedule == LrScheduleKind::Plateau) {
         return Err("epoch settings require standalone SFNN production training with step/cos/geometric LR".into());
@@ -24840,23 +24863,25 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
                 format!("cuda-cpp cumulative step overflow at epoch={epoch}, superbatch={last_superbatch}")
             })?;
             let chunk_end_step = chunk_start_step.checked_add(steps).ok_or("epoch step overflow")?.saturating_sub(1);
-            let lr_start = cuda_cpp_lr_at_step(
+            let lr_start = cuda_cpp_epoch_lr(
                 args,
+                epoch,
                 chunk_start_step,
                 batch_size,
-                0,
                 lr_period,
                 lr_step_gamma,
                 lr_step_positions,
+                batches_per_superbatch,
             );
-            let lr_end = cuda_cpp_lr_at_step(
+            let lr_end = cuda_cpp_epoch_lr(
                 args,
+                epoch,
                 chunk_end_step,
                 batch_size,
-                0,
                 lr_period,
                 lr_step_gamma,
                 lr_step_positions,
+                batches_per_superbatch,
             );
             chunks.push(CudaCppScheduleChunk {
                 epoch,
@@ -24890,6 +24915,30 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         lr_step_positions,
         chunks,
     })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_epoch_lr(
+    args: &Args, epoch: usize, step: usize, batch_size: usize,
+    period: u64, gamma: f32, step_positions: u64, batches_per_sb: usize,
+) -> f32 {
+    let warmup_steps = if epoch == 1 { args.warmup_sb.saturating_mul(batches_per_sb) } else { 0 };
+    if warmup_steps == 0 {
+        return cuda_cpp_lr_at_step(args, step, batch_size, 0, period, gamma, step_positions);
+    }
+    // Callers pass the first batch of an accumulated optimizer update.
+    // Quantize to that update so logging and the actual update use the same LR.
+    let bpu = args.batches_per_update.max(1);
+    if step < warmup_steps {
+        let end = ((step / bpu + 1) * bpu).min(warmup_steps);
+        return args.lr * (end as f64 / warmup_steps as f64) as f32;
+    }
+    let remaining = period.saturating_sub((warmup_steps as u64).saturating_mul(batch_size as u64));
+    let gamma = if args.lr_schedule == LrScheduleKind::Step && args.lr_step_gamma.is_none() {
+        let n = remaining.saturating_sub(1) / step_positions.max(1);
+        if n == 0 { 1.0 } else { (args.lr_min as f64 / args.lr as f64).powf(1.0 / n as f64) as f32 }
+    } else { gamma };
+    cuda_cpp_lr_at_step(args, step - warmup_steps, batch_size, 0, remaining, gamma, step_positions)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -25117,6 +25166,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("optimizer={}", args.optimizer.cli_name()),
         format!("lr={:.9}", args.lr),
         format!("lr_min={:.9}", args.lr_min),
+        format!("warmup_sb={}", args.warmup_sb),
         format!("lr_step_gamma={lr_step_gamma:.9}"),
         format!(
             "lr_step_positions={}",
@@ -25436,6 +25486,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_saturation_penalty=",
         "sfnn_saturation_threshold=127.000000000",
     );
+    ensure_line_after(&mut out, "warmup_sb=", "lr_min=", "warmup_sb=0");
     ensure_line_after(&mut out, "sfnn_norm_loss_strength=", "sfnn_saturation_penalty=", "sfnn_norm_loss_strength=0.000000000");
     ensure_line_after(&mut out, "sfnn_l1_saturation_backward_alpha=", "sfnn_saturation_penalty=", "sfnn_l1_saturation_backward_alpha=0.000000000");
     ensure_line_after(&mut out, "sfnn_qat_l1=", "sfnn_saturation_threshold=", "sfnn_qat_l1=false");
@@ -33588,6 +33639,77 @@ mod tests {
                 assert!(!resume_signature_matches(&stored.replace("lr=0.000875000", "lr=0.000123000"), &args));
             }
         }
+    }
+
+    #[test]
+    fn warmup_sb_cli_json_validation() {
+        let base = ["bulletou", "--backend", "cuda-cpp", "--arch", "SFNN_halfka2_1024_8_64_k3k3",
+            "--teacher", "/dev/null", "--superbatches", "16", "--max-epochs", "2"];
+        let off = Args::try_parse_from(base).unwrap();
+        assert_eq!(off.warmup_sb, 0);
+        let mut argv: Vec<std::ffi::OsString> = base.map(Into::into).to_vec();
+        bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),
+            "warmup_sb", &serde_json::json!(1), &mut argv).unwrap();
+        let mut args = Args::try_parse_from(argv).unwrap();
+        assert_eq!(args.warmup_sb, 1);
+        args.validate_arch_flags().unwrap();
+        args.warmup_sb = 17;
+        assert!(args.validate_arch_flags().is_err());
+        args.warmup_sb = 1;
+        args.lr_schedule = LrScheduleKind::Plateau;
+        assert!(args.validate_arch_flags().is_err());
+        let old = resume_signature_without_line(&resume_signature(&off), "warmup_sb=");
+        assert!(resume_signature_matches(&old, &off));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn warmup_sb_lr_boundaries_bpu_and_epoch_resume() {
+        let mut args = Args::try_parse_from(["bulletou", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfka2_1024_8_64_k3k3",
+            "--lr", "0.001", "--lr-min", "0.00001", "--warmup-sb", "1"]).unwrap();
+        // Four SB, eight batches/SB, batch size 64.
+        let rate = |a: &Args, epoch, step| cuda_cpp_epoch_lr(a, epoch, step, 64, 2048, 0.5, 512, 8);
+        for bpu in [1, 2, 4, 8] {
+            args.batches_per_update = bpu;
+            assert!((rate(&args, 1, 0) - args.lr * bpu as f32 / 8.0).abs() < 1e-9);
+            assert_eq!(rate(&args, 1, 8 - bpu), args.lr);
+            assert_eq!(rate(&args, 1, 8), args.lr);
+            assert!((rate(&args, 1, 32 - bpu) - args.lr_min).abs() < 1e-9);
+            assert_eq!(rate(&args, 2, 0), args.lr); // No repeated warmup.
+        }
+        args.lr_step_gamma = Some(1.0);
+        assert_eq!(cuda_cpp_epoch_lr(&args, 1, 31, 64, 2048, 1.0, 512, 8), args.lr);
+        args.lr_step_gamma = None;
+        for kind in [LrScheduleKind::Step, LrScheduleKind::Cos, LrScheduleKind::Geometric] {
+            args.lr_schedule = kind;
+            assert_eq!(rate(&args, 1, 8), args.lr);
+        }
+        args.warmup_sb = 0;
+        for step in 0..32 {
+            assert_eq!(rate(&args, 1, step), cuda_cpp_lr_at_step(&args, step, 64, 0, 2048, 0.5, 512));
+        }
+        args.warmup_sb = 4;
+        assert_eq!(rate(&args, 1, 31), args.lr);
+        assert_eq!(rate(&args, 2, 0), args.lr);
+        // Production resume uses chunk epoch/SB, not a restarted local step counter.
+        args.warmup_sb = 2;
+        args.superbatches = Some(4);
+        args.max_epochs = Some(2);
+        args.positions_per_superbatch = 512;
+        args.batch_size = Some(64);
+        args.batches_per_update = 1;
+        args.lr_schedule = LrScheduleKind::Step;
+        let mut schedule = cuda_cpp_run_schedule(&args).unwrap();
+        schedule.chunks = vec![CudaCppScheduleChunk {
+            epoch: 1, superbatch: 2, batches_per_superbatch: 8, batches_per_update: 1,
+            steps: 8, cumulative_steps: 8, save_checkpoint: false, run_validation: false,
+            run_quantized_validation: false, lr_start: 0.0, lr_end: 0.0,
+        }];
+        assert_eq!(schedule.lr_for_step(&args, 0, 64), rate(&args, 1, 8));
+        schedule.chunks[0].epoch = 2;
+        schedule.chunks[0].superbatch = 1;
+        assert_eq!(schedule.lr_for_step(&args, 0, 64), args.lr);
     }
 
     #[test]

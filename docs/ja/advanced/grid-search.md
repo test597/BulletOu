@@ -1,5 +1,31 @@
 # Grid searchで学習条件を比較する
 
+## 学習開始時のLR warmup
+
+JSONの `"warmup_sb": 1`（CLI: `--warmup-sb 1`）で、**1epoch目の最初の1sbだけ**、ほぼ0から指定の`lr`まで線形に増加させます。非負整数で、デフォルト`0`は無効です。
+
+- cuda-cppの通常学習とworkerの`step` / `geometric` / `cos`に対応。`plateau`とdirect-step smokeモードは未対応で、指定時はエラーです。
+- optimizer更新ごとに変更します。warmup中の更新総数をW、更新番号をu（1～W）とすると `lr × u/W`。bpuが異なっても指定sbの末尾で`lr`に達します。
+- warmupは学習量に含まれます。16sb、warmup 1sbなら、増加1sb＋通常スケジュール15sbです。warmupをepoch全体と同じ長さにすれば、そのepochは増加だけです。
+- 残りの区間で通常の減衰を行います。自動step gammaは残り区間に合わせて計算します。明示的な`lr_step_gamma: 1.0`ならwarmup後は固定LRです。
+- **2epoch目以降には適用しません。** resumeは保存済みepoch/sbから続行し、warmupをやり直しません。別runへの`initial_state`による追加学習と独立したgrid/worker trialでは、それぞれのepoch 1から適用します。
+- epoch別の値変更には対応せず、run全体で一つの整数です。`warmup_sb`は保存情報とgrid CSVに記録します。
+
+比較例（共通設定で`superbatches: 16`、`max_epochs: 1`を確認してください）：
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260922-progress8-bceloss-16sb.json `
+  --output-folder D:\BulletOu-snapshots\20260922\grid-progress8-warmup `
+  --grid loss_bce_with_logits true `
+  --grid sfnn_l1_saturation_backward_alpha 0 `
+  --grid lr 0.000400 `
+  --grid lr_step_gamma 1.0 `
+  --grid warmup_sb 0 1 4
+```
+
+3条件の比較です。飽和時backward係数は0に固定し、warmupだけを変えます。
+
 ## L1の飽和時backward係数
 
 `--sfnn-l1-saturation-backward-alpha 0.01`（JSON: `"sfnn_l1_saturation_backward_alpha": 0.01`）で、L1の上限飽和時にも近似勾配を通せます。範囲は0～1、デフォルト0は従来動作です。cuda-cppのSFNN / LayerStack用です。
