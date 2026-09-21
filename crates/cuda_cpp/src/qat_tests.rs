@@ -1,5 +1,62 @@
 use super::*;
 
+#[test]
+fn sfnn_l1_saturation_alpha_validation() {
+    assert_eq!(SfnnLayerLrMultipliers::default().l1_saturation_backward_alpha, 0.0);
+    for alpha in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+        assert!(SfnnLayerLrMultipliers { l1_saturation_backward_alpha: alpha, ..Default::default() }.validate().is_err());
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA-capable NVIDIA GPU"]
+fn sfnn_l1_saturation_alpha_gpu_chain_rule() {
+    let ctx = Context::new(0).unwrap();
+    for z in [-2.0_f32, -0.5, 0.0, 0.5, 1.0, 1.002, 2.0] {
+        let mut host = tiny_sfnn_weights(tiny_sfnn_shape());
+        let w = vec![0.0; host.l1w.len()];
+        let mut bias = vec![z; host.l1b.len()];
+        for b in 0..host.shape.num_stacks { bias[b * 3 + 2] = 0.02; }
+        host.l1w = &w;
+        host.l1b = &bias;
+        host.l1fw = None; host.l1fb = None;
+        host.l2fw = None; host.l2fb = None;
+        host.l3fw = None; host.l3fb = None;
+        let mut runner = SfnnTrainStepRunner::new(&ctx, host, 4, 3).unwrap();
+        let mut reference_output = None;
+        let mut reference_skip = None;
+        for alpha in [0.0, 0.01, 1.0, 0.0] {
+            runner.step_no_readback_with_loss_finalize_update_and_lr_multipliers(
+                &ctx, RangerUpdateParams::default(), ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+                1.0, batch(), true, false,
+                SfnnLayerLrMultipliers { l1_saturation_backward_alpha: alpha, ..Default::default() },
+            ).unwrap();
+            let output = runner.forward_workspace.download_output(&ctx).unwrap();
+            if let Some(ref expected) = reference_output { assert_eq!(&output, expected); }
+            else { reference_output = Some(output); }
+            let g = runner.backward_workspace.download(&ctx).unwrap();
+            let sq = z*z*(127.0/128.0);
+            for sample in 0..4 {
+                for unit in 0..2 {
+                    let square_gate = if sq >= 1.0 { alpha } else if sq > 0.0 { 1.0 } else { 0.0 };
+                    let normal_gate = if z >= 1.0 { alpha } else if z > 0.0 { 1.0 } else { 0.0 };
+                    let expected = square_gate * g.l2_input_gradients[sample*4+unit] * (2.0*z*127.0/128.0)
+                        + normal_gate * g.l2_input_gradients[sample*4+2+unit];
+                    assert!((g.l1_gradients[sample*3+unit]-expected).abs() < 1e-6,
+                        "z={z} alpha={alpha} actual={} expected={expected}", g.l1_gradients[sample*3+unit]);
+                }
+            }
+            let skip: Vec<_> = (0..4).map(|s| g.l1_gradients[s*3+2]).collect();
+            if let Some(ref expected) = reference_skip { assert_eq!(&skip, expected); }
+            else { reference_skip = Some(skip); }
+            if alpha == 0.0 {
+                let cpu = tiny_sfnn_backward_cpu(host_batch(), host, batch().targets, batch().entry_weights);
+                assert_close_slice("alpha0 legacy", &g.l1_gradients, &cpu.l1_gradients, 1e-6);
+            }
+        }
+    }
+}
+
 fn batch() -> SfnnTrainStepHostBatch<'static> {
     SfnnTrainStepHostBatch {
         stm_indices: &[0, 1, -1, 2, -1, -1, 1, 3, -1, 3, 2, -1],

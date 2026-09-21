@@ -3165,7 +3165,8 @@ __global__ void sfnn_l2_input_backward_kernel(
     float* l1_gradients,
     size_t batch,
     size_t l1_hidden,
-    int l1_skip) {
+    int l1_skip,
+    float saturation_backward_alpha) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     size_t total = batch * l1_out;
@@ -3187,6 +3188,16 @@ __global__ void sfnn_l2_input_backward_kernel(
     float square_grad = crelu_pre_gradient_from_value(l2_input[square_idx], l2_input_gradients[square_idx]) *
         (2.0f * value * SFNN_PAIRWISE_SCALE);
     float linear_grad = crelu_pre_gradient_from_value(l2_input[linear_idx], l2_input_gradients[linear_idx]);
+    // Preserve the alpha=0 arithmetic path, and retain the square derivative's sign.
+    if (saturation_backward_alpha > 0.0f) {
+        if (l2_input[square_idx] >= 1.0f) {
+            square_grad = saturation_backward_alpha * l2_input_gradients[square_idx] *
+                (2.0f * value * SFNN_PAIRWISE_SCALE);
+        }
+        if (value >= 1.0f) {
+            linear_grad = saturation_backward_alpha * l2_input_gradients[linear_idx];
+        }
+    }
     l1_gradients[tid] += square_grad + linear_grad;
 }
 
@@ -6000,6 +6011,7 @@ int launch_sfnn_backward_kernels(
     const float* l2,
     const float* l1w,
     const float* qat_l1w,
+    float l1_saturation_backward_alpha,
     const float* l1fw,
     int has_l1f,
     const float* l1axw,
@@ -6400,7 +6412,7 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
     sfnn_l2_input_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        l1, l2_input, l2_input_gradients, l1_gradients, batch, l1_hidden, l1_skip);
+        l1, l2_input, l2_input_gradients, l1_gradients, batch, l1_hidden, l1_skip, l1_saturation_backward_alpha);
     if (check_kernel_launch("sfnn_l2_input_backward_kernel launch") != 0) {
         return -1;
     }
@@ -9589,6 +9601,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     const BulletOuCudaCppF32Buffer* l2,
     const BulletOuCudaCppF32Buffer* l1w,
     const BulletOuCudaCppF32Buffer* qat_l1w,
+    float l1_saturation_backward_alpha,
     const BulletOuCudaCppF32Buffer* l1fw,
     int has_l1f,
     const BulletOuCudaCppF32Buffer* l1axw,
@@ -9811,6 +9824,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             l2->ptr,
             l1w->ptr,
             qat_l1w != nullptr ? qat_l1w->ptr : nullptr,
+            l1_saturation_backward_alpha,
             has_l1f != 0 ? l1fw->ptr : nullptr,
             has_l1f,
             has_l1ax != 0 ? l1axw->ptr : nullptr,
@@ -9904,6 +9918,7 @@ int sfnn_backward_train_device_impl(
     const BulletOuCudaCppF32Buffer* l2,
     const BulletOuCudaCppF32Buffer* l1w,
     const BulletOuCudaCppF32Buffer* qat_l1w,
+    float l1_saturation_backward_alpha,
     const BulletOuCudaCppF32Buffer* l1fw,
     int has_l1f,
     const BulletOuCudaCppF32Buffer* l1axw,
@@ -10114,6 +10129,7 @@ int sfnn_backward_train_device_impl(
             l2->ptr,
             l1w->ptr,
             qat_l1w != nullptr ? qat_l1w->ptr : nullptr,
+            l1_saturation_backward_alpha,
             has_l1f != 0 ? l1fw->ptr : nullptr,
             has_l1f,
             has_l1ax != 0 ? l1axw->ptr : nullptr,
@@ -10207,6 +10223,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     const BulletOuCudaCppF32Buffer* l2,
     const BulletOuCudaCppF32Buffer* l1w,
     const BulletOuCudaCppF32Buffer* qat_l1w,
+    float l1_saturation_backward_alpha,
     const BulletOuCudaCppF32Buffer* l1fw,
     int has_l1f,
     const BulletOuCudaCppF32Buffer* l1axw,
@@ -10314,6 +10331,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         l2,
         l1w,
         qat_l1w,
+        l1_saturation_backward_alpha,
         l1fw,
         has_l1f,
         l1axw,
@@ -10402,6 +10420,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     const BulletOuCudaCppF32Buffer* l2,
     const BulletOuCudaCppF32Buffer* l1w,
     const BulletOuCudaCppF32Buffer* qat_l1w,
+    float l1_saturation_backward_alpha,
     const BulletOuCudaCppF32Buffer* l1fw,
     int has_l1f,
     const BulletOuCudaCppF32Buffer* l1axw,
@@ -10511,6 +10530,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         l2,
         l1w,
         qat_l1w,
+        l1_saturation_backward_alpha,
         l1fw,
         has_l1f,
         l1axw,

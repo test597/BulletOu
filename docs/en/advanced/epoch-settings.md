@@ -27,6 +27,7 @@ Merge these fields into a complete training configuration. Values apply from the
 | `sfnn_freeze_l1` | Freeze/unfreeze L1 |
 | `sfnn_l1_lr_mult` | L1 LR multiplier |
 | `sfnn_norm_loss_strength` | Norm regularization strength |
+| `sfnn_l1_saturation_backward_alpha` | L1 normal/square upper-saturation backward coefficient, 0–1; 0 preserves legacy behavior |
 | `sfnn_saturation_penalty`, `sfnn_saturation_threshold` | Saturation penalty strength and threshold |
 | `optimizer_weight_clip` | Weight clip width (0 disables) |
 | `optimizer_weight_decay` | Weight decay strength |

@@ -4069,6 +4069,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 const EPOCH_SETTING_KEYS: &[&str] = &[
     "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
+    "sfnn_l1_saturation_backward_alpha",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
 ];
@@ -4117,6 +4118,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
         }
         assign!(lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
+            sfnn_l1_saturation_backward_alpha,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
     if !resolved.lr.is_finite() || !resolved.lr_min.is_finite() || resolved.lr <= 0.0
@@ -5157,6 +5159,11 @@ struct Args {
     #[arg(long = "sfnn-saturation-penalty", default_value = "0.0")]
     sfnn_saturation_penalty: f32,
 
+    /// Backward-only upper-clamp leak for L1 normal/square branches, in [0,1].
+    /// Zero preserves hard-clamp gradients. Forward, FT, L2/L3 and skip are unchanged.
+    #[arg(long, default_value_t = 0.0)]
+    sfnn_l1_saturation_backward_alpha: f32,
+
     /// Decoupled bullet-shogi NormLoss toward tensor L2 norm 1 (0 disables).
     /// FT weights excluded; FT bias and dense tensors included. Not bucket-wise.
     #[arg(long, default_value = "0.0")]
@@ -5291,6 +5298,13 @@ impl Args {
             if self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some() {
                 return Err("--sfnn-qat-l1 supports dense L1 only (not grouped/common-shard L1)".to_string());
             }
+        }
+        if !self.sfnn_l1_saturation_backward_alpha.is_finite()
+            || !(0.0..=1.0).contains(&self.sfnn_l1_saturation_backward_alpha) {
+            return Err("--sfnn-l1-saturation-backward-alpha must be finite and in [0, 1]".to_string());
+        }
+        if self.sfnn_l1_saturation_backward_alpha != 0.0 && !self.eval_type().uses_layerstack() {
+            return Err("--sfnn-l1-saturation-backward-alpha requires cuda-cpp SFNN / LayerStack".to_string());
         }
         if self.ft_factorizer_alpha != 1.0
             && (self.no_ft_factorize || self.resolved_eval_type() != Some(EvalType::SfnnHalfka2))
@@ -17345,6 +17359,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         );
     }
     print_sfnn_qat_mode(args);
+    print_startup_kv_colored("L1 saturation backward", format!("alpha={} (normal/square only; forward unchanged)", args.sfnn_l1_saturation_backward_alpha), ConsoleColor::Magenta);
     if args.sfnn_saturation_penalty != 0.0 {
         print_startup_kv_colored(
             "saturation penalty",
@@ -24513,6 +24528,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
         update_scope: args.sfnn_update_scope.into(),
         factorizer_residual_decay: args.sfnn_factorizer_residual_decay,
         saturation_penalty: args.sfnn_saturation_penalty,
+        l1_saturation_backward_alpha: args.sfnn_l1_saturation_backward_alpha,
         saturation_threshold: args.sfnn_saturation_threshold,
         tatara_weight_clip: uses_tatara_weight_clip(args),
         qat_l1: args.sfnn_qat_l1,
@@ -25187,6 +25203,7 @@ fn resume_signature_values(args: &Args) -> String {
             effective_sfnn_hand_progress_pair_count_confidence(args)
         ),
         format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),
+        format!("sfnn_l1_saturation_backward_alpha={:.9}", args.sfnn_l1_saturation_backward_alpha),
         format!("sfnn_norm_loss_strength={:.9}", args.sfnn_norm_loss_strength),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_qat_l1={}", args.sfnn_qat_l1),
@@ -25420,6 +25437,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_saturation_threshold=127.000000000",
     );
     ensure_line_after(&mut out, "sfnn_norm_loss_strength=", "sfnn_saturation_penalty=", "sfnn_norm_loss_strength=0.000000000");
+    ensure_line_after(&mut out, "sfnn_l1_saturation_backward_alpha=", "sfnn_saturation_penalty=", "sfnn_l1_saturation_backward_alpha=0.000000000");
     ensure_line_after(&mut out, "sfnn_qat_l1=", "sfnn_saturation_threshold=", "sfnn_qat_l1=false");
     ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_qat_l1=", "sfnn_l1_lr_mult=1.000000000");
     ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
@@ -25434,6 +25452,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_normalize_defaults(signature);
     // QAT can be explicitly enabled/disabled for fine-tuning existing FP32 states.
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
+    let signature = resume_signature_without_line(&signature, "sfnn_l1_saturation_backward_alpha=");
     let signature = resume_signature_without_line(&signature, "test_batch_size=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_rate=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_exact=");
@@ -33569,6 +33588,38 @@ mod tests {
                 assert!(!resume_signature_matches(&stored.replace("lr=0.000875000", "lr=0.000123000"), &args));
             }
         }
+    }
+
+    #[test]
+    fn sfnn_l1_saturation_backward_alpha_cli_json_and_resume() {
+        let base = ["bulletou", "--backend", "cuda-cpp", "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--teacher", "/dev/null"];
+        let off = Args::try_parse_from(base).unwrap();
+        assert_eq!(off.sfnn_l1_saturation_backward_alpha, 0.0);
+        for alpha in [0.0, 0.01, 1.0] {
+            let mut argv: Vec<std::ffi::OsString> = base.map(Into::into).to_vec();
+            bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),
+                "sfnn_l1_saturation_backward_alpha", &serde_json::json!(alpha), &mut argv).unwrap();
+            let args = Args::try_parse_from(argv).unwrap();
+            assert!(args.validate_arch_flags().is_ok());
+            assert_eq!(args.sfnn_l1_saturation_backward_alpha, alpha as f32);
+            assert!(resume_signature_matches(&resume_signature(&off), &args));
+            #[cfg(feature = "cuda-cpp-backend")]
+            assert_eq!(cuda_cpp_sfnn_layer_lr_multipliers(&args, None).l1_saturation_backward_alpha, alpha as f32);
+        }
+        for alpha in [-0.1, 1.01, f32::NAN, f32::INFINITY] {
+            let mut args = off.clone();
+            args.sfnn_l1_saturation_backward_alpha = alpha;
+            assert!(args.validate_arch_flags().is_err());
+        }
+        let legacy = resume_signature_without_line(&resume_signature(&off), "sfnn_l1_saturation_backward_alpha=");
+        assert!(resume_signature_matches(&legacy, &off));
+        let mut scheduled = off.clone();
+        scheduled.epoch_settings_json = Some(r#"{"sfnn_l1_saturation_backward_alpha":{"epoch1":0,"epoch3":0.01}}"#.into());
+        assert_eq!(args_at_epoch(&scheduled, 2).unwrap().sfnn_l1_saturation_backward_alpha, 0.0);
+        assert_eq!(args_at_epoch(&scheduled, 3).unwrap().sfnn_l1_saturation_backward_alpha, 0.01);
+        scheduled.epoch_settings_json = Some(r#"{"sfnn_l1_saturation_backward_alpha":{"epoch1":0,"epoch3":2}}"#.into());
+        assert!(args_at_epoch(&scheduled, 2).is_ok());
+        assert!(args_at_epoch(&scheduled, 3).is_err());
     }
 
     #[test]

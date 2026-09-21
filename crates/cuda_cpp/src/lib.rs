@@ -1886,6 +1886,7 @@ pub struct SfnnForwardWorkspace {
     // Training-only fake-quantized L1, never part of a checkpoint or validation weights.
     qat_l1: Option<SfnnL1Qat>,
     qat_l1_active: std::cell::Cell<bool>,
+    pub l1_saturation_backward_alpha: f32,
 }
 
 impl SfnnForwardWorkspace {
@@ -1920,6 +1921,7 @@ impl SfnnForwardWorkspace {
             output: F32Buffer::new(ctx, layout.output_len())?,
             qat_l1: None,
             qat_l1_active: std::cell::Cell::new(false),
+            l1_saturation_backward_alpha: 0.0,
         })
     }
 
@@ -3654,6 +3656,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
             forward.l2.as_ptr(),
             weights.l1w.as_ptr(),
             forward.qat_l1_backward_weights(),
+            forward.l1_saturation_backward_alpha,
             l1fw,
             has_l1f,
             l1axw,
@@ -3848,6 +3851,7 @@ fn sfnn_backward_device_impl(
                 forward.l2.as_ptr(),
                 weights.l1w.as_ptr(),
                 forward.qat_l1_backward_weights(),
+                forward.l1_saturation_backward_alpha,
                 l1fw,
                 has_l1f,
                 l1axw,
@@ -3934,6 +3938,7 @@ fn sfnn_backward_device_impl(
                 forward.l2.as_ptr(),
                 weights.l1w.as_ptr(),
                 forward.qat_l1_backward_weights(),
+                forward.l1_saturation_backward_alpha,
                 l1fw,
                 has_l1f,
                 l1axw,
@@ -6177,6 +6182,8 @@ pub struct SfnnLayerLrMultipliers {
     pub tatara_weight_clip: bool,
     /// Training-only L1 fake quantization; FP32 master parameters use identity STE.
     pub qat_l1: bool,
+    /// Backward-only leak at the L1 activation upper bound; zero preserves hard clamp.
+    pub l1_saturation_backward_alpha: f32,
 }
 
 impl Default for SfnnLayerLrMultipliers {
@@ -6193,12 +6200,16 @@ impl Default for SfnnLayerLrMultipliers {
             saturation_threshold: 127.0,
             tatara_weight_clip: false,
             qat_l1: false,
+            l1_saturation_backward_alpha: 0.0,
         }
     }
 }
 
 impl SfnnLayerLrMultipliers {
     pub fn validate(self) -> Result<()> {
+        if !self.l1_saturation_backward_alpha.is_finite() || !(0.0..=1.0).contains(&self.l1_saturation_backward_alpha) {
+            return Err(CudaCppError::message("SFNN L1 saturation backward alpha must be finite and in [0, 1]"));
+        }
         if !self.norm_loss_strength.is_finite() || self.norm_loss_strength < 0.0 {
             return Err(CudaCppError::message("SFNN norm loss strength must be finite and non-negative"));
         }
@@ -7100,6 +7111,7 @@ impl SfnnTrainStepRunner {
         self.validate()?;
         lr_multipliers.validate()?;
         self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
+        self.forward_workspace.l1_saturation_backward_alpha = lr_multipliers.l1_saturation_backward_alpha;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -7262,6 +7274,7 @@ impl SfnnTrainStepRunner {
         self.validate()?;
         lr_multipliers.validate()?;
         self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
+        self.forward_workspace.l1_saturation_backward_alpha = lr_multipliers.l1_saturation_backward_alpha;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -7390,6 +7403,7 @@ impl SfnnTrainStepRunner {
         self.validate()?;
         lr_multipliers.validate()?;
         self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
+        self.forward_workspace.l1_saturation_backward_alpha = lr_multipliers.l1_saturation_backward_alpha;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -9502,6 +9516,7 @@ mod ffi {
             l2: *mut BulletOuCudaCppF32Buffer,
             l1w: *mut BulletOuCudaCppF32Buffer,
             qat_l1w: *mut BulletOuCudaCppF32Buffer,
+            l1_saturation_backward_alpha: f32,
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
             l1axw: *mut BulletOuCudaCppF32Buffer,
@@ -9586,6 +9601,7 @@ mod ffi {
             l2: *mut BulletOuCudaCppF32Buffer,
             l1w: *mut BulletOuCudaCppF32Buffer,
             qat_l1w: *mut BulletOuCudaCppF32Buffer,
+            l1_saturation_backward_alpha: f32,
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
             l1axw: *mut BulletOuCudaCppF32Buffer,
@@ -9671,6 +9687,7 @@ mod ffi {
             l2: *mut BulletOuCudaCppF32Buffer,
             l1w: *mut BulletOuCudaCppF32Buffer,
             qat_l1w: *mut BulletOuCudaCppF32Buffer,
+            l1_saturation_backward_alpha: f32,
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
             l1axw: *mut BulletOuCudaCppF32Buffer,

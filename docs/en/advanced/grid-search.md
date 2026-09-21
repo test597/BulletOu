@@ -1,5 +1,23 @@
 # Compare training conditions with grid search
 
+## L1 saturation backward alpha
+
+Use `--sfnn-l1-saturation-backward-alpha 0.01`, or JSON `"sfnn_l1_saturation_backward_alpha": 0.01`, to leak approximate gradients through saturated L1 upper clamps. Range: 0–1. Default: **0 (legacy behavior)**. Supported by cuda-cpp SFNN / LayerStack training.
+
+- Normal branch `clamp(z,0,1)`: derivative α at `z>=1`; the lower clamp remains zero.
+- Square branch `clamp(c*z²,0,1)`, `c=127/128`: derivative `α*2*c*z` at upper saturation, preserving the sign for negative z.
+- Forward, FT, L2/L3 activations, skip, quantization and exported inference equations are unchanged. This is separate from QAT's rounding STE.
+- This is a surrogate derivative, not the exact forward derivative. It can also push values further outside the clamp; improvement is not guaranteed.
+- Per-epoch settings and worker training are supported. Values are recorded in resume metadata and grid CSV, and may be explicitly changed on resume.
+
+Add this axis to your grid command:
+
+```powershell
+--grid sfnn_l1_saturation_backward_alpha 0 0.001 0.01 0.1
+```
+
+For a 32-superbatch scratch comparison, use `max_epochs: 1`, `superbatches: 32`, `positions_per_superbatch: 40000000`, with no initial checkpoint. For fixed LR, use `lr_schedule: "step"` with equal `lr` and `lr_min`. Keep other settings identical. Lower saturation alone may mean slower learning; also compare loss, subsequent learning and playing strength. This option does not add per-unit saturation statistics.
+
 The common JSON supports [per-epoch settings](epoch-settings.md), such as `"lr": {"epoch1": 0.0004, "epoch11": 0.0002}`, including boolean transitions for QAT. The CSV records effective values for each epoch.
 
 `grid_summary.csv` updates **after each completed epoch during training**, as well as at trial start, exit, and interruption. The runner checks the trainer's `summary-learn.csv` approximately once per second, without waiting for more stdout or the whole trial to finish. In a ten-epoch trial, epoch 1 results therefore appear as soon as they are complete. Unfinished epochs retain blank metric cells; `--epochs` still controls which epochs are reported. Partial source records and temporarily locked output files produce a warning and are retried without stopping training.
