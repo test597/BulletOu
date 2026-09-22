@@ -11059,10 +11059,11 @@ extern "C" int bulletou_cuda_cpp_rebase_shared_device(
 }
 
 __global__ void experiment_center_affine_kernel(float* w, float* b, float* sw, float* sb,
-    float* gw, const float* gb, const float* c, size_t cols, bool before) {
+    float* gw, const float* gb, const float* c, size_t cols, bool before, size_t group_rows, size_t center_stride) {
     __shared__ float fast[256];
     __shared__ float slow[256];
     const size_t row=blockIdx.x, j=threadIdx.x, i=row*cols+j;
+    c += (row/group_rows)*center_stride;
     float f=0.0f,s=0.0f;
     if(j<cols) {
         f=w[i]*c[j]; s=sw[i]*c[j];
@@ -11087,7 +11088,7 @@ extern "C" int bulletou_experiment_center_affine(BulletOuCudaCppContext* ctx,
        validate_buffer(ctx,gw,rows*cols,"center gw")!=0 || validate_buffer(ctx,gb,rows,"center gb")!=0 ||
        validate_buffer(ctx,c,cols,"center c")!=0) return -1;
     experiment_center_affine_kernel<<<static_cast<unsigned>(rows),256,0,ctx->stream>>>(
-        w->ptr,b->ptr,sw->ptr,sb->ptr,gw->ptr,gb->ptr,c->ptr,cols,before!=0);
+        w->ptr,b->ptr,sw->ptr,sb->ptr,gw->ptr,gb->ptr,c->ptr,cols,before!=0,rows,cols);
     return check_kernel_launch("experimental output centering");
 }
 
@@ -11100,6 +11101,57 @@ extern "C" int bulletou_experiment_column_mean(BulletOuCudaCppContext* ctx,
     if (check_kernel_launch("centering partial") != 0) return -1;
     experiment_mean_finish<<<(cols+255)/256,256,0,ctx->stream>>>(scratch->ptr,rows,cols);
     return check_kernel_launch("centering finish");
+}
+
+__global__ void bucket_center_partial(const float* x,const int* buckets,float* scratch,size_t n,size_t d,size_t stacks) {
+    const size_t c=threadIdx.x, b=blockIdx.x, part=blockIdx.y;
+    if(c>d) return;
+    float s=0;
+    for(size_t i=part;i<n;i+=32) if(buckets[i]==b) s+=c==d?1.0f:x[i*d+c];
+    scratch[part*stacks*(d+1)+b*(d+1)+c]=s;
+}
+__global__ void bucket_center_finish(float* scratch,size_t n,size_t width) {
+    const size_t c=blockIdx.x*blockDim.x+threadIdx.x;
+    if(c>=width)return;
+    float s=0;for(size_t p=0;p<32;++p)s+=scratch[p*width+c];
+    scratch[c]=s/n;
+}
+__global__ void bucket_center_normalize(const float* sums,float* centers,size_t d,size_t stacks) {
+    const size_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=stacks*(d+1))return;
+    float count=sums[(i/(d+1))*(d+1)+d];
+    centers[i]=count>0?sums[i]/count:0;
+}
+extern "C" int bulletou_experiment_bucket_mean(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* input,BulletOuCudaCppI32Buffer* buckets,BulletOuCudaCppF32Buffer* scratch,
+    size_t n,size_t d,size_t stacks) {
+    if(!n || !d || d>256 || !stacks || stacks>65536 ||
+       validate_buffer(ctx,input,n*d,"bucket mean x")!=0 || validate_i32_buffer(ctx,buckets,n,"bucket mean ids")!=0 ||
+       validate_buffer(ctx,scratch,32*stacks*(d+1),"bucket mean scratch")!=0)return -1;
+    bucket_center_partial<<<dim3(stacks,32),d+1,0,ctx->stream>>>(input->ptr,buckets->ptr,scratch->ptr,n,d,stacks);
+    if(check_kernel_launch("bucket center partial")!=0)return -1;
+    size_t width=stacks*(d+1);
+    bucket_center_finish<<<(width+255)/256,256,0,ctx->stream>>>(scratch->ptr,n,width);
+    return check_kernel_launch("bucket center finish");
+}
+extern "C" int bulletou_experiment_bucket_centers(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* sums,BulletOuCudaCppF32Buffer* centers,size_t d,size_t stacks) {
+    const size_t width=stacks*(d+1);
+    if(validate_buffer(ctx,sums,width,"bucket sums")!=0 || validate_buffer(ctx,centers,width,"bucket centers")!=0)return -1;
+    bucket_center_normalize<<<(width+255)/256,256,0,ctx->stream>>>(sums->ptr,centers->ptr,d,stacks);
+    return check_kernel_launch("bucket center normalize");
+}
+extern "C" int bulletou_experiment_center_affine_bucket(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w,BulletOuCudaCppF32Buffer* b,BulletOuCudaCppF32Buffer* sw,BulletOuCudaCppF32Buffer* sb,
+    BulletOuCudaCppF32Buffer* gw,BulletOuCudaCppF32Buffer* gb,BulletOuCudaCppF32Buffer* c,
+    size_t rows,size_t cols,size_t group_rows,int before) {
+    if(!rows || !cols || cols>256 || !group_rows || rows%group_rows ||
+       validate_buffer(ctx,w,rows*cols,"bucket w")!=0 || validate_buffer(ctx,b,rows,"bucket b")!=0 ||
+       validate_buffer(ctx,sw,rows*cols,"bucket sw")!=0 || validate_buffer(ctx,sb,rows,"bucket sb")!=0 ||
+       validate_buffer(ctx,gw,rows*cols,"bucket gw")!=0 || validate_buffer(ctx,gb,rows,"bucket gb")!=0 ||
+       validate_buffer(ctx,c,(rows/group_rows)*(cols+1),"bucket c")!=0)return -1;
+    experiment_center_affine_kernel<<<rows,256,0,ctx->stream>>>(w->ptr,b->ptr,sw->ptr,sb->ptr,gw->ptr,gb->ptr,c->ptr,cols,before!=0,group_rows,cols+1);
+    return check_kernel_launch("bucket affine center");
 }
 
 extern "C" int bulletou_experiment_mean_penalty_test(BulletOuCudaCppContext* ctx,

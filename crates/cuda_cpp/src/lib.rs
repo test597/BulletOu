@@ -6105,6 +6105,7 @@ pub struct SfnnTrainStepRunner {
     experimental_output_centers: Option<(F32Buffer, F32Buffer)>,
     output_center_sums: Option<(F32Buffer, F32Buffer)>,
     output_center_batches: usize,
+    output_center_bucketwise: bool,
     pending_gradient_batches: usize,
     pub shape: SfnnForwardShape,
     pub batch_size: usize,
@@ -6437,8 +6438,10 @@ impl SfnnTrainStepRunner {
             factorizer_alpha,
             output_center_sums: None,
             output_center_batches: 0,
+            output_center_bucketwise: std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref()==Ok("1"),
             pending_gradient_batches: 0,
-            experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu") {
+            experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu")
+                && std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref() != Ok("1") {
                 Some((F32Buffer::new(ctx, 32 * shape.l2_in())?, F32Buffer::new(ctx, 32 * shape.l2_size)?))
             } else { None },
             forward_workspace: SfnnForwardWorkspace::new(ctx, SfnnForwardWorkspaceLayout::new(shape, batch_size))?,
@@ -7362,7 +7365,7 @@ impl SfnnTrainStepRunner {
                 &slot.entry_weights,
             )?;
         }
-        experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
+        experimental_output_center::accumulate_from_slot(self, ctx, lr_multipliers.l2_l3_center, Some(slot_idx))?;
         self.pending_gradient_batches += 1;
         if update_weights {
             self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
@@ -9123,6 +9126,9 @@ mod ffi {
         pub fn bulletou_experiment_column_mean(ctx: *mut BulletOuCudaCppContext,
             input: *mut BulletOuCudaCppF32Buffer, scratch: *mut BulletOuCudaCppF32Buffer,
             rows: usize, cols: usize) -> i32;
+        pub fn bulletou_experiment_bucket_mean(ctx:*mut BulletOuCudaCppContext,input:*mut BulletOuCudaCppF32Buffer,buckets:*mut BulletOuCudaCppI32Buffer,scratch:*mut BulletOuCudaCppF32Buffer,n:usize,d:usize,stacks:usize)->i32;
+        pub fn bulletou_experiment_bucket_centers(ctx:*mut BulletOuCudaCppContext,sums:*mut BulletOuCudaCppF32Buffer,centers:*mut BulletOuCudaCppF32Buffer,d:usize,stacks:usize)->i32;
+        pub fn bulletou_experiment_center_affine_bucket(ctx:*mut BulletOuCudaCppContext,w:*mut BulletOuCudaCppF32Buffer,b:*mut BulletOuCudaCppF32Buffer,sw:*mut BulletOuCudaCppF32Buffer,sb:*mut BulletOuCudaCppF32Buffer,gw:*mut BulletOuCudaCppF32Buffer,gb:*mut BulletOuCudaCppF32Buffer,c:*mut BulletOuCudaCppF32Buffer,rows:usize,cols:usize,group_rows:usize,before:i32)->i32;
         pub fn bulletou_cuda_cpp_sfnn_validation_stats(
             ctx: *mut BulletOuCudaCppContext,
             stm: *mut BulletOuCudaCppF32Buffer, nstm: *mut BulletOuCudaCppF32Buffer,
