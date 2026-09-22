@@ -6174,6 +6174,8 @@ impl SfnnUpdateScope {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SfnnLayerLrMultipliers {
+    /// Batch-input-centered optimizer coordinates for L2/L3 (bpu=1 only).
+    pub l2_l3_center: bool,
     pub norm_loss_strength: f32,
     pub l0: f32,
     pub l1: f32,
@@ -6193,6 +6195,7 @@ pub struct SfnnLayerLrMultipliers {
 impl Default for SfnnLayerLrMultipliers {
     fn default() -> Self {
         Self {
+            l2_l3_center: false,
             norm_loss_strength: 0.0,
             l0: 1.0,
             l1: 1.0,
@@ -8016,6 +8019,12 @@ impl SfnnTrainStepRunner {
         lr_multipliers: SfnnLayerLrMultipliers,
         dirty_buckets: Option<&[i32]>,
     ) -> Result<()> {
+        if lr_multipliers.l2_l3_center && self.experimental_output_centers.is_none() {
+            self.experimental_output_centers = Some((
+                F32Buffer::new(ctx, 32 * self.shape.l2_in())?,
+                F32Buffer::new(ctx, 32 * self.shape.l2_size)?,
+            ));
+        }
         self.forward_workspace.invalidate_l1_qat();
         lr_multipliers.validate()?;
         let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;

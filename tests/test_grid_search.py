@@ -194,6 +194,14 @@ class GridSearchTests(unittest.TestCase):
         for trial in plan["trials"]:
             self.assertEqual(trial["settings"]["wrm_target_offset"], self.common["wrm_target_offset"])
 
+    def test_l2_l3_center_grid_boolean_and_summary(self):
+        plan = self.plan(["--grid", "sfnn-l2-l3-center", "false", "true"])
+        fields, rows = grid.summarize(self.output, plan)
+        self.assertEqual(fields.count("sfnn_l2_l3_center"), 1)
+        self.assertEqual({row["sfnn_l2_l3_center"] for row in rows}, {False, True})
+        single = self.plan(["--grid", "sfnn-l2-l3-center", "true"])
+        self.assertTrue(all(t["settings"]["sfnn_l2_l3_center"] is True for t in single["trials"]))
+
     def complete_plan(self, plan):
         for trial in plan["trials"]:
             directory = grid.trial_dir(self.output, trial)

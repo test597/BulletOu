@@ -198,4 +198,6 @@ SFNN enables tatara-style weight clipping by default: L1/L2 weights and biases, 
 
 For tuning and comparison experiments, see the [Advanced guide](../advanced/).
 
+For the opt-in [L2/L3 optimizer centering](../advanced/l2-l3-centering.md) experiment, set `sfnn_l2_l3_center: true` (default off). Check its constraints, including bpu=1 and disabled clipping.
+
 Previous: [2. Prepare training data](2-data.md)

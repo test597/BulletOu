@@ -1,4 +1,4 @@
-//! Explicit bpu=1 diagnostic: center optimizer coordinates of L2/L3 only.
+//! Opt-in bpu=1 optimizer coordinates of L2/L3; GPU production option and host reference.
 //! Forward/checkpoints retain the folded affine form. Not native Ranger.
 use super::*;
 
@@ -16,19 +16,25 @@ fn mean(ctx:&Context,x:&F32Buffer,n:usize,d:usize)->Result<Vec<f32>> {
     let mut c=scratch.download(ctx)?;c.truncate(d);Ok(c)
 }
 pub(super) fn capture(r:&SfnnTrainStepRunner,ctx:&Context,p:RangerUpdateParams,lr:SfnnLayerLrMultipliers)->Result<Option<Centers>> {
-    let gpu=match std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER") {
+    let gpu=if lr.l2_l3_center { true } else { match std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER") {
         Err(std::env::VarError::NotPresent)=>return Ok(None),
         Ok(s) if s=="1"=>false,
         Ok(s) if s=="gpu"=>true,
         _=>return Err(CudaCppError::message("output centering expects 1 (host reference) or gpu")),
-    };
+    }};
+    if p.radam.gradient_factor != 1.0 || lr.update_scope != SfnnUpdateScope::All {
+        return Err(CudaCppError::message("L2/L3 centering requires batches-per-update=1 and update-scope=all"));
+    }
+    if r.shape.l2_in() > 256 || r.shape.l2_size > 256 || r.weights.l2b.len() > 65536 {
+        return Err(CudaCppError::message("L2/L3 centering supports L2 input/output widths <=256 and stacks*L2 <=65536"));
+    }
     if r.weights.l2fw.is_some() || r.weights.l3fw.is_some() || r.factorizer.any_axis()
         || r.residual_count_gates_enabled || lr.tatara_weight_clip || p.radam.decay!=0.0
         || lr.norm_loss_strength!=0.0 || lr.factorizer_residual_decay!=0.0 || lr.saturation_penalty!=0.0
         || p.radam.min_weight > -1e20 || p.radam.max_weight < 1e20
         || std::env::var_os("BULLETOU_EXPERIMENT_L1_CENTER").is_some()
         || std::env::var_os("BULLETOU_EXPERIMENT_L1_PROJECT_UPDATE").is_some() {
-        return Err(CudaCppError::message("output centering requires none/shared, no gates/clip/penalties/other centering"));
+        return Err(CudaCppError::message("L2/L3 centering requires none/shared, no gates/clip/penalties/other centering"));
     }
     static ANNOUNCE:std::sync::Once=std::sync::Once::new();
     ANNOUNCE.call_once(||eprintln!("  EXPERIMENT output centering: L2/L3 batch-global input means; FT/L1 untouched; folded bias fast/slow coordinates; bpu=1 diagnostic; implementation={}",if gpu {"gpu"}else{"host reference"}));
@@ -62,6 +68,47 @@ pub(super) fn transform(r:&SfnnTrainStepRunner,ctx:&Context,c:&Centers,before:bo
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn option_update_matches_explicit_centering_and_reuses_buffers() {
+        let ctx=Context::new(0).unwrap(); let s=crate::tests::tiny_sfnn_shape();
+        let mut weights=crate::tests::tiny_sfnn_weights(s);
+        weights.l2fw=None; weights.l2fb=None; weights.l3fw=None; weights.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,weights,4,1).unwrap();
+        let mut reference=SfnnTrainStepRunner::new(&ctx,weights,4,1).unwrap();
+        let policy=SfnnLayerLrMultipliers{l2_l3_center:true,..Default::default()};
+        assert!(r.experimental_output_centers.is_none());
+        let mut address=None;
+        for step in 1..=18 {
+            let c2=0.1+step as f32*0.01; let c3=0.2+step as f32*0.01;
+            for runner in [&r,&reference] {
+                runner.forward_workspace.l2_input.fill(&ctx,c2).unwrap();
+                runner.forward_workspace.l2.fill(&ctx,c3).unwrap();
+                runner.backward_workspace.zero_parameter_gradients(&ctx).unwrap();
+                runner.backward_workspace.l2w_gradients.fill(&ctx,0.03).unwrap();
+                runner.backward_workspace.l2b_gradients.fill(&ctx,0.02).unwrap();
+                runner.backward_workspace.l3w_gradients.fill(&ctx,-0.02).unwrap();
+                runner.backward_workspace.l3b_gradients.fill(&ctx,0.04).unwrap();
+            }
+            let mut p=RangerUpdateParams::default(); p.radam.step=step;
+            r.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,p,policy,None).unwrap();
+            let current=r.experimental_output_centers.as_ref().unwrap().0.as_ptr();
+            if let Some(old)=address {assert_eq!(old,current);} address=Some(current);
+            let centers=Centers{l2:vec![c2;s.l2_in()],l3:vec![c3;s.l2_size],device:false};
+            transform(&reference,&ctx,&centers,true).unwrap();
+            reference.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,p,Default::default(),None).unwrap();
+            transform(&reference,&ctx,&centers,false).unwrap();
+            for (a,b) in [(&r.weights.l2w,&reference.weights.l2w),(&r.weights.l2b,&reference.weights.l2b),
+                (&r.weights.l3w,&reference.weights.l3w),(&r.weights.l3b,&reference.weights.l3b),
+                (&r.optimizer_states.l2w.momentum,&reference.optimizer_states.l2w.momentum),
+                (&r.optimizer_states.l3b.slow_params,&reference.optimizer_states.l3b.slow_params)] {
+                for (a,b) in a.download(&ctx).unwrap().iter().zip(b.download(&ctx).unwrap()) {assert!((a-b).abs()<2e-6);}
+            }
+        }
+        let p=RangerUpdateParams::default();
+        assert!(capture(&r,&ctx,p,Default::default()).unwrap().is_none());
+        assert!(capture(&r,&ctx,p,SfnnLayerLrMultipliers{tatara_weight_clip:true,..policy}).is_err());
+        let mut p=p; p.radam.gradient_factor=0.25;
+        assert!(capture(&r,&ctx,p,policy).is_err());
+    }
     #[test] fn gpu_and_host_centering_match_ranger_fast_slow_and_moments() {
         let ctx=Context::new(0).unwrap();
         for cols in [14,64] {

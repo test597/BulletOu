@@ -190,3 +190,5 @@ HalfKA2 / HalfKPのFT（最初の層）の重み共有はデフォルトで有�
 SFNNでは、学習中の重み制限がデフォルトで有効です。tataraと同じくL1・L2の重みとbias、L3の重みを±1.984375に収め、FTと出力biasは制限しません。無効にする場合は `--optimizer-weight-clip 0`（JSONでは `"optimizer_weight_clip": 0`）を指定します。[設定の意味と注意点](../advanced/tuning.md#学習中の重み制限)
 
 詳しい調整や比較実験: [応用編](../advanced/)
+
+L2/L3の飽和を抑える比較実験用の [L2/L3中心化](../advanced/l2-l3-centering.md) は、`sfnn_l2_l3_center: true` で有効化します（デフォルト無効）。bpu=1、clip無効などの対応条件を確認してください。
