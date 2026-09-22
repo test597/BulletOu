@@ -5335,9 +5335,6 @@ impl Args {
                 || self.superbatches.is_none() || self.max_epochs.is_none() {
                 return Err("--warmup-sb requires cuda-cpp production training with step/geometric/cos LR".into());
             }
-            if self.warmup_sb > self.superbatches.unwrap() && self.max_epochs != Some(1) {
-                return Err("--warmup-sb may exceed --superbatches only with --max-epochs 1 (warmup-prefix experiment)".into());
-            }
         }
         if self.sfnn_qat_l1 {
             if !self.eval_type().uses_layerstack() {
@@ -24732,6 +24729,10 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         print_startup_kv("LR warmup", format!(
             "{} sb, epoch 1 only; linear per optimizer update to {}; included in epoch length (resume keeps progress)",
             args.warmup_sb, args.lr));
+        if args.warmup_sb > args.superbatches.unwrap() {
+            eprintln!("WARN: warmup_sb={} exceeds superbatches={}; epoch 1 ends before reaching the configured LR. Warmup does not carry into epoch 2; later epochs use the regular LR schedule.",
+                args.warmup_sb, args.superbatches.unwrap());
+        }
     }
     if args.epoch_settings_json.is_some() && (!args.eval_type().uses_layerstack()
         || args.cuda_cpp_train_steps.is_some() || args.lr_schedule == LrScheduleKind::Plateau) {
@@ -33709,7 +33710,7 @@ mod tests {
         assert_eq!(args.warmup_sb, 1);
         args.validate_arch_flags().unwrap();
         args.warmup_sb = 17;
-        assert!(args.validate_arch_flags().is_err());
+        args.validate_arch_flags().unwrap();
         args.max_epochs = Some(1);
         args.validate_arch_flags().unwrap();
         args.warmup_sb = 1;

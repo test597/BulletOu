@@ -2,7 +2,7 @@
 
 ## Initial LR warmup
 
-For short prefix experiments, `warmup_sb > superbatches` is allowed only with `max_epochs: 1`. For example, `superbatches: 1, warmup_sb: 1024` trains only the first SB of warmup, ending at `lr/1024`. It neither compresses warmup nor carries it into another epoch.
+`warmup_sb > superbatches` is allowed with a warning. For example, `superbatches: 1, warmup_sb: 1024` trains only the first SB of warmup in epoch 1, ending at `lr/1024`. It neither compresses warmup nor carries it into another epoch. Epoch 2 and later use the regular schedule, so LR may jump at that boundary.
 
 Set `"warmup_sb": 1` in JSON or `--warmup-sb 1` on the CLI. During **only the first SB of epoch 1**, LR rises linearly from near zero to `lr`. This is a nonnegative integer, default `0` (disabled).
 

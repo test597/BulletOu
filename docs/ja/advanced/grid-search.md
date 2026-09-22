@@ -2,7 +2,7 @@
 
 ## 学習開始時のLR warmup
 
-短期比較では、`max_epochs: 1`に限り`warmup_sb > superbatches`を指定できます。例えば`superbatches: 1, warmup_sb: 1024`はwarmupの最初の1sbだけ学習し、終了時LRは`lr/1024`です。warmupを1sbに短縮したり、次epochに繰り越したりはしません。
+`warmup_sb > superbatches`も指定できます（警告表示）。例えば`superbatches: 1, warmup_sb: 1024`はepoch 1でwarmupの最初の1sbだけ学習し、終了時LRは`lr/1024`です。warmupを1sbに短縮したり、次epochに繰り越したりはしません。epoch 2以降は通常スケジュールに戻るため、LRが急増し得ます。
 
 JSONの `"warmup_sb": 1`（CLI: `--warmup-sb 1`）で、**1epoch目の最初の1sbだけ**、ほぼ0から指定の`lr`まで線形に増加させます。非負整数で、デフォルト`0`は無効です。
 
