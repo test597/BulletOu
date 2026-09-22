@@ -63,6 +63,21 @@ class GridSearchTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 grid.check_settings({**self.common, key: value})
 
+    def test_warmup_epoch_zero_summary(self):
+        plan = self.plan(["--grid", "warmup_sb", "64"])
+        for trial in plan["trials"]:
+            directory = grid.trial_dir(self.output, trial)
+            self.summary(directory, [self.metrics(epoch=0, sb=63)])
+        _, rows = grid.summarize(self.output, plan)
+        self.assertTrue(all(not r.get("test_value_accuracy") for r in rows if r["epoch"] == 0))
+        for trial in plan["trials"]:
+            self.summary(grid.trial_dir(self.output, trial), [self.metrics(epoch=0, sb=64), self.metrics(epoch=1)])
+        _, rows = grid.summarize(self.output, plan)
+        warmup = [r for r in rows if r["epoch"] == 0]
+        self.assertEqual(len(warmup), len(plan["trials"]))
+        self.assertTrue(all(r["status"] == "done" for r in warmup))
+        self.assertEqual(grid.resolve_epoch_settings({"lr": {"epoch1": .001, "epoch2": .0001}}, 0)["lr"], .001)
+
     def test_epoch_settings_grid_override_and_summary(self):
         settings = {**self.common, "lr": {"epoch1": .0004, "epoch2": .0002},
                     "sfnn_qat_l1": {"epoch1": True, "epoch2": False}}

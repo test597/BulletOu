@@ -162,6 +162,7 @@ EPOCH_SETTING_KEYS = {
 
 
 def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
+    epoch = max(1, epoch)  # Warmup epoch 0 inherits epoch 1 controls.
     resolved = dict(settings)
     for key, value in settings.items():
         if not isinstance(value, dict):
@@ -502,7 +503,7 @@ def remember_completed_epoch_settings(directory: Path, trial: dict) -> None:
     for epoch in sorted({int(r["epoch"]) for r in rows}):
         group = [r for r in rows if int(r["epoch"]) == epoch]
         settings = epoch_settings(trial, epoch, group)
-        if int(group[-1]["superbatch"]) == settings["superbatches"]:
+        if int(group[-1]["superbatch"]) == (settings.get("warmup_sb", 0) if epoch == 0 else settings["superbatches"]):
             trial.setdefault("epoch_settings", {})[str(epoch)] = {
                 "rows_digest": rows_digest(group), "settings": copy.deepcopy(settings),
             }
@@ -595,13 +596,16 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
             trial_status = "done"
         elif trial_status == "done":
             trial_status = "incomplete"
-        for epoch in epochs or plan["report_epochs"]:
+        report_epochs = list(epochs or plan["report_epochs"])
+        if trial["settings"].get("warmup_sb", 0) > 0 and 0 not in report_epochs:
+            report_epochs = [0, *report_epochs]
+        for epoch in report_epochs:
             if epoch > trial["settings"]["max_epochs"]:
                 continue  # Unselected conditions were not extended.
             group = [row for row in rows if int(row["epoch"]) == epoch]
             last = group[-1] if group else {}
             settings = resolve_epoch_settings(epoch_settings(trial, epoch, group), epoch)
-            closed = last and int(last["superbatch"]) == settings["superbatches"]
+            closed = last and int(last["superbatch"]) == (settings.get("warmup_sb", 0) if epoch == 0 else settings["superbatches"])
             row = {key: settings.get(key, "") for key in parameter_columns}
             if not closed:
                 row.update(trial=trial["id"], epoch=epoch,
@@ -650,7 +654,8 @@ def live_summary_updates(root: Path, plan: dict, path: Path, trial: dict, *, int
     directory = trial_dir(root, trial)
 
     def closed_rows(rows):
-        return [r for r in rows if int(r["superbatch"]) == trial["settings"]["superbatches"]]
+        return [r for r in rows if int(r["superbatch"]) == (
+            trial["settings"].get("warmup_sb", 0) if int(r["epoch"]) == 0 else trial["settings"]["superbatches"])]
 
     previous = closed_rows(log_rows(directory))
 

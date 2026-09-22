@@ -2,15 +2,16 @@
 
 ## Initial LR warmup
 
-`warmup_sb > superbatches` is allowed with a warning. For example, `superbatches: 1, warmup_sb: 1024` trains only the first SB of warmup in epoch 1, ending at `lr/1024`. It neither compresses warmup nor carries it into another epoch. Epoch 2 and later use the regular schedule, so LR may jump at that boundary.
+Warmup is an independent **epoch 0**, unrestricted by `superbatches`. For example, `warmup_sb: 1024, superbatches: 64, max_epochs: 1` runs 1024 warmup SB plus 64 regular SB (1088 total), not just a one-SB prefix.
 
-Set `"warmup_sb": 1` in JSON or `--warmup-sb 1` on the CLI. During **only the first SB of epoch 1**, LR rises linearly from near zero to `lr`. This is a nonnegative integer, default `0` (disabled).
+Set `"warmup_sb": 1` in JSON or `--warmup-sb 1` on the CLI for a one-SB epoch 0. LR rises linearly from near zero to `lr`. This is a nonnegative integer, default `0` (disabled).
 
 - Supported for cuda-cpp production step/geometric/cos schedules, including workers. Plateau and direct-step smoke mode reject nonzero warmup.
 - For optimizer update u=1..W during warmup, LR is `lr * u/W`. BPU changes do not change the requested SB duration.
-- Warmup is included in the training budget: 16 SB with 1 SB warmup leaves 15 SB for the regular schedule. An epoch entirely occupied by warmup only ramps up.
-- Automatic step gamma is recomputed for the remaining first-epoch interval. Explicit `lr_step_gamma: 1.0` keeps LR constant after warmup.
-- **Never repeats at epoch 2 or later.** Resume uses saved epoch/SB coordinates, not a fresh warmup. Separate initial-state runs and independent grid/worker trials start their own epoch 1.
+- Epoch 0 is additional to `max_epochs`; regular epoch lengths and decay schedules are unchanged. Warmup uses epoch 1 settings, including LR and BPU.
+- Regular decay begins at epoch 1. Explicit `lr_step_gamma: 1.0` keeps LR constant during regular epochs.
+- Resume continues at the saved epoch/SB, without repeating warmup. A completed epoch 0 resumes at epoch 1. Separate initial-state runs and independent grid/worker trials start a new epoch 0.
+- Epoch 0 follows the normal save/validation intervals and epoch-end save controls. It is recorded in `summary-learn.csv`, `summary-epoch-last.csv`, and `grid_summary.csv`. This differs from the old within-epoch-1 warmup semantics: start comparisons in a new output folder.
 - `warmup_sb` is run-wide, not an epoch-mapped setting. It is recorded in checkpoint metadata and grid CSV.
 
 With common settings configured for 16 SB and one epoch, compare three conditions:

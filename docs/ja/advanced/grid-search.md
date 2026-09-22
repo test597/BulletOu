@@ -2,15 +2,16 @@
 
 ## 学習開始時のLR warmup
 
-`warmup_sb > superbatches`も指定できます（警告表示）。例えば`superbatches: 1, warmup_sb: 1024`はepoch 1でwarmupの最初の1sbだけ学習し、終了時LRは`lr/1024`です。warmupを1sbに短縮したり、次epochに繰り越したりはしません。epoch 2以降は通常スケジュールに戻るため、LRが急増し得ます。
+warmupは独立した**epoch 0**です。`warmup_sb`は`superbatches`より大きくても構いません。例えば`warmup_sb: 1024, superbatches: 64, max_epochs: 1`はwarmupを1024sb、通常学習を64sb、合計1088sb実行します。最初の1sbだけで打ち切る指定ではありません。
 
-JSONの `"warmup_sb": 1`（CLI: `--warmup-sb 1`）で、**1epoch目の最初の1sbだけ**、ほぼ0から指定の`lr`まで線形に増加させます。非負整数で、デフォルト`0`は無効です。
+JSONの `"warmup_sb": 1`（CLI: `--warmup-sb 1`）で、epoch 0を1sb実行し、ほぼ0から指定の`lr`まで線形に増加させます。非負整数で、デフォルト`0`は無効です。
 
 - cuda-cppの通常学習とworkerの`step` / `geometric` / `cos`に対応。`plateau`とdirect-step smokeモードは未対応で、指定時はエラーです。
 - optimizer更新ごとに変更します。warmup中の更新総数をW、更新番号をu（1～W）とすると `lr × u/W`。bpuが異なっても指定sbの末尾で`lr`に達します。
-- warmupは学習量に含まれます。16sb、warmup 1sbなら、増加1sb＋通常スケジュール15sbです。warmupをepoch全体と同じ長さにすれば、そのepochは増加だけです。
-- 残りの区間で通常の減衰を行います。自動step gammaは残り区間に合わせて計算します。明示的な`lr_step_gamma: 1.0`ならwarmup後は固定LRです。
-- **2epoch目以降には適用しません。** resumeは保存済みepoch/sbから続行し、warmupをやり直しません。別runへの`initial_state`による追加学習と独立したgrid/worker trialでは、それぞれのepoch 1から適用します。
+- `max_epochs`にepoch 0は含みません。通常epochのsb数や減衰スケジュールは変えません。epoch 0にはepoch 1の設定（LR、bpuなど）を使います。
+- epoch 1から通常の減衰を行います。明示的な`lr_step_gamma: 1.0`なら通常epochは固定LRです。
+- resumeは保存済みepoch/sbから続行し、warmupをやり直しません。epoch 0完了checkpointならepoch 1から再開します。別runへの`initial_state`による追加学習と独立したgrid/worker trialでは、新たにepoch 0から適用します。
+- epoch 0も通常の保存・検証間隔とepoch末尾保存の設定に従います。`summary-learn.csv`、`summary-epoch-last.csv`、`grid_summary.csv`にepoch 0として記録します。旧仕様のepoch 1内warmupとは意味が異なるため、比較実験は新しい出力フォルダで開始してください。
 - epoch別の値変更には対応せず、run全体で一つの整数です。`warmup_sb`は保存情報とgrid CSVに記録します。
 
 比較例（共通設定で`superbatches: 16`、`max_epochs: 1`を確認してください）：

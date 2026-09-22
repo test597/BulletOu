@@ -3423,6 +3423,11 @@ fn print_cuda_cpp_quantized_validation_summary(
 }
 
 fn print_epoch_banner(epoch: usize, max_epochs: usize) {
+    if epoch == 0 {
+        eprintln!("\n  {} {}", paint_log_tag("[epoch]", ConsoleColor::Magenta),
+            paint("start epoch 0 (warmup; additional to regular epochs)", ConsoleColor::BoldCyan));
+        return;
+    }
     if max_epochs == usize::MAX {
         eprintln!(
             "\n  {} {}",
@@ -4102,6 +4107,7 @@ fn epoch_setting_value(value: &serde_json::Value, epoch: usize) -> Result<&serde
 }
 
 fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
+    let epoch = epoch.max(1); // Independent warmup epoch uses epoch 1 settings.
     let mut resolved = args.clone();
     let Some(json) = args.epoch_settings_json.as_ref() else { return Ok(resolved); };
     let schedules: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).map_err(|e| format!("invalid epoch settings: {e}"))?;
@@ -4752,8 +4758,8 @@ struct Args {
     #[arg(long)]
     lr_step_gamma: Option<f32>,
 
-    /// Linear LR warmup during the first N superbatches of epoch 1 (0 disables).
-    /// Included in the epoch length; resumes do not restart it.
+    /// Independent epoch 0 of N superbatches, linearly increasing LR (0 disables).
+    /// Added before --max-epochs regular epochs; resumes do not restart it.
     /// Supported by cuda-cpp production step/geometric/cos schedules, including workers.
     #[arg(long, default_value_t = 0)]
     warmup_sb: usize,
@@ -18090,7 +18096,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 schedule.lr_step_gamma = effective_lr_step_gamma(&epoch_args, schedule.batches_per_superbatch)?.0;
                 let changes: serde_json::Map<String, serde_json::Value> = serde_json::from_str(base_args.epoch_settings_json.as_ref().unwrap()).map_err(|e| e.to_string())?;
                 let resolved: serde_json::Map<String, serde_json::Value> = changes.iter()
-                    .map(|(key, value)| Ok((key.clone(), epoch_setting_value(value, progress.epoch)?.clone())))
+                    .map(|(key, value)| Ok((key.clone(), epoch_setting_value(value, progress.epoch.max(1))?.clone())))
                     .collect::<Result<_, String>>()?;
                 eprintln!("  [epoch settings] epoch={} {}", progress.epoch, serde_json::Value::Object(resolved));
                 active_epoch = Some(progress.epoch);
@@ -24376,6 +24382,13 @@ struct CudaCppRunSchedule {
 
 #[cfg(feature = "cuda-cpp-backend")]
 impl CudaCppRunSchedule {
+    fn epoch_superbatches(&self, epoch: usize) -> usize {
+        if epoch == 0 {
+            self.chunks.iter().filter(|c| c.epoch == 0).map(|c| c.superbatch).max().unwrap_or(0)
+        } else {
+            self.superbatches_per_epoch
+        }
+    }
     fn lr_for_step(&self, args: &Args, step_index: usize, batch_size: usize) -> f32 {
         if self.production && (args.epoch_settings_json.is_some() || args.warmup_sb > 0) {
             if let Some(progress) = self.progress_for_step(step_index.saturating_add(1)) {
@@ -24418,7 +24431,7 @@ impl CudaCppRunSchedule {
             return Some(CudaCppScheduleProgress {
                 epoch: chunk.epoch,
                 superbatch: first_superbatch + offset / batches_per_superbatch,
-                superbatches_per_epoch: self.superbatches_per_epoch,
+                superbatches_per_epoch: self.epoch_superbatches(chunk.epoch),
                 batch_in_superbatch: offset % batches_per_superbatch + 1,
                 batches_per_superbatch,
                 batches_per_update: chunk.batches_per_update.max(1),
@@ -24727,12 +24740,8 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     if args.warmup_sb > 0 {
         args.validate_arch_flags()?;
         print_startup_kv("LR warmup", format!(
-            "{} sb, epoch 1 only; linear per optimizer update to {}; included in epoch length (resume keeps progress)",
+            "{} sb in independent epoch 0; linear per optimizer update to {}; additional to max_epochs (resume keeps progress)",
             args.warmup_sb, args.lr));
-        if args.warmup_sb > args.superbatches.unwrap() {
-            eprintln!("WARN: warmup_sb={} exceeds superbatches={}; epoch 1 ends before reaching the configured LR. Warmup does not carry into epoch 2; later epochs use the regular LR schedule.",
-                args.warmup_sb, args.superbatches.unwrap());
-        }
     }
     if args.epoch_settings_json.is_some() && (!args.eval_type().uses_layerstack()
         || args.cuda_cpp_train_steps.is_some() || args.lr_schedule == LrScheduleKind::Plateau) {
@@ -24806,12 +24815,13 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let prev_teacher = if resume_enabled { read_latest_saved_teacher(&output_dir) } else { None };
     let teacher_changed =
         prev_teacher.as_deref().is_some_and(|prev| prev.trim() != resolve_teacher_for_log(&args.teacher).trim());
-    let prev_run_completed_epoch = latest_checkpoint_superbatch.map(|last_sb| last_sb >= superbatches).unwrap_or(false);
+    let previous_epoch_sbs = if latest_checkpoint_epoch == 0 { args.warmup_sb } else { superbatches };
+    let prev_run_completed_epoch = latest_checkpoint_superbatch.map(|last_sb| last_sb >= previous_epoch_sbs).unwrap_or(false);
     let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && latest_checkpoint_progress.is_some();
-    let start_epoch = if !resume_enabled {
-        1
+    let start_epoch = if latest_checkpoint_progress.is_none() {
+        if args.warmup_sb > 0 { 0 } else { 1 }
     } else if mid_epoch_resume {
-        latest_checkpoint_epoch.max(1)
+        latest_checkpoint_epoch
     } else if resume_enabled {
         latest_checkpoint_epoch.saturating_add(1).max(1)
     } else {
@@ -24869,6 +24879,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         quantized_validation_enabled && quantized_validation_is_epoch_end_only(args);
     let save_epoch_end = effective_save_epoch_end(args);
     for epoch in start_epoch..=max_epochs {
+        let superbatches = if epoch == 0 { args.warmup_sb } else { superbatches };
         let epoch_args = args_at_epoch(args, epoch)?;
         let args = &epoch_args;
         let batches_per_superbatch = effective_batches_per_superbatch(args)?;
@@ -24973,7 +24984,7 @@ fn cuda_cpp_epoch_lr(
     args: &Args, epoch: usize, step: usize, batch_size: usize,
     period: u64, gamma: f32, step_positions: u64, batches_per_sb: usize,
 ) -> f32 {
-    let warmup_steps = if epoch == 1 { args.warmup_sb.saturating_mul(batches_per_sb) } else { 0 };
+    let warmup_steps = if epoch == 0 { args.warmup_sb.saturating_mul(batches_per_sb) } else { 0 };
     if warmup_steps == 0 {
         return cuda_cpp_lr_at_step(args, step, batch_size, 0, period, gamma, step_positions);
     }
@@ -24984,12 +24995,7 @@ fn cuda_cpp_epoch_lr(
         let end = ((step / bpu + 1) * bpu).min(warmup_steps);
         return args.lr * (end as f64 / warmup_steps as f64) as f32;
     }
-    let remaining = period.saturating_sub((warmup_steps as u64).saturating_mul(batch_size as u64));
-    let gamma = if args.lr_schedule == LrScheduleKind::Step && args.lr_step_gamma.is_none() {
-        let n = remaining.saturating_sub(1) / step_positions.max(1);
-        if n == 0 { 1.0 } else { (args.lr_min as f64 / args.lr as f64).powf(1.0 / n as f64) as f32 }
-    } else { gamma };
-    cuda_cpp_lr_at_step(args, step - warmup_steps, batch_size, 0, remaining, gamma, step_positions)
+    args.lr
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -26008,7 +26014,7 @@ fn read_epoch_last_summary_rows(
         }
         let epoch = fields[epoch_index].parse::<usize>().map_err(|_| invalid())?;
         let sb = fields[sb_index].parse::<usize>().map_err(|_| invalid())?;
-        if epoch == 0 || sb == 0 {
+        if sb == 0 {
             return Err(invalid());
         }
         if let Some(i) = column("eval") {
@@ -26081,7 +26087,7 @@ fn read_existing_epoch_summary_rows(
             .strip_prefix("epoch ")
             .and_then(|value| value.parse::<usize>().ok())
             .ok_or_else(|| std::io::Error::other("invalid epoch summary column"))?;
-        if epoch == 0 || rows.contains_key(&epoch) {
+        if rows.contains_key(&epoch) {
             return Err(std::io::Error::other("invalid or duplicate epoch summary column"));
         }
         epochs.push(epoch);
@@ -26193,14 +26199,19 @@ fn warn_epoch_summary_error(output_dir: &Path, result: std::io::Result<()>) {
 }
 
 fn maybe_update_epoch_last_summary(output_dir: &Path, args: &Args, epoch: usize, sb: usize) {
-    if args.superbatches == Some(sb) {
+    if (if epoch == 0 { Some(args.warmup_sb) } else { args.superbatches }) == Some(sb) {
         warn_epoch_summary_error(output_dir, refresh_epoch_last_summary(output_dir, epoch));
     }
 }
 
 /// Called before overwriting resume-config.txt with the new run's controls.
 fn initialize_epoch_last_summary(output_dir: &Path) -> std::io::Result<()> {
-    let rows = read_epoch_last_summary_rows(output_dir)?;
+    let mut rows = read_epoch_last_summary_rows(output_dir)?;
+    let stored_warmup = std::fs::read_to_string(output_dir.join(RESUME_CONFIG_NAME)).ok()
+        .and_then(|text| text.lines().find_map(|line| line.strip_prefix("warmup_sb=")?.parse::<usize>().ok()));
+    if rows.get(&0).is_some_and(|row| stored_warmup != Some(row.superbatch)) {
+        rows.remove(&0); // Do not publish an interrupted warmup as a completed epoch.
+    }
     let stored_sbs = std::fs::read_to_string(output_dir.join(RESUME_CONFIG_NAME))
         .ok()
         .and_then(|text| text.lines().find_map(|line| line.strip_prefix("superbatches=")?.parse::<usize>().ok()));
@@ -33730,10 +33741,10 @@ mod tests {
         let rate = |a: &Args, epoch, step| cuda_cpp_epoch_lr(a, epoch, step, 64, 2048, 0.5, 512, 8);
         for bpu in [1, 2, 4, 8] {
             args.batches_per_update = bpu;
-            assert!((rate(&args, 1, 0) - args.lr * bpu as f32 / 8.0).abs() < 1e-9);
-            assert_eq!(rate(&args, 1, 8 - bpu), args.lr);
-            assert_eq!(rate(&args, 1, 8), args.lr);
-            assert!((rate(&args, 1, 32 - bpu) - args.lr_min).abs() < 1e-9);
+            assert!((rate(&args, 0, 0) - args.lr * bpu as f32 / 8.0).abs() < 1e-9);
+            assert_eq!(rate(&args, 0, 8 - bpu), args.lr);
+            assert_eq!(rate(&args, 1, 0), args.lr);
+            assert_eq!(rate(&args, 1, 32 - bpu), cuda_cpp_lr_at_step(&args, 32-bpu, 64, 0, 2048, 0.5, 512));
             assert_eq!(rate(&args, 2, 0), args.lr); // No repeated warmup.
         }
         args.lr_step_gamma = Some(1.0);
@@ -33741,16 +33752,16 @@ mod tests {
         args.lr_step_gamma = None;
         for kind in [LrScheduleKind::Step, LrScheduleKind::Cos, LrScheduleKind::Geometric] {
             args.lr_schedule = kind;
-            assert_eq!(rate(&args, 1, 8), args.lr);
+            assert_eq!(rate(&args, 1, 0), args.lr);
         }
         args.warmup_sb = 0;
         for step in 0..32 {
             assert_eq!(rate(&args, 1, step), cuda_cpp_lr_at_step(&args, step, 64, 0, 2048, 0.5, 512));
         }
         args.warmup_sb = 4;
-        assert_eq!(rate(&args, 1, 31), args.lr);
+        assert_eq!(rate(&args, 0, 31), args.lr);
         args.warmup_sb = 1024;
-        assert_eq!(rate(&args, 1, 7), args.lr / 1024.0);
+        assert_eq!(rate(&args, 0, 7), args.lr / 1024.0);
         args.warmup_sb = 4;
         assert_eq!(rate(&args, 2, 0), args.lr);
         // Production resume uses chunk epoch/SB, not a restarted local step counter.
@@ -33763,14 +33774,50 @@ mod tests {
         args.lr_schedule = LrScheduleKind::Step;
         let mut schedule = cuda_cpp_run_schedule(&args).unwrap();
         schedule.chunks = vec![CudaCppScheduleChunk {
-            epoch: 1, superbatch: 2, batches_per_superbatch: 8, batches_per_update: 1,
+            epoch: 0, superbatch: 2, batches_per_superbatch: 8, batches_per_update: 1,
             steps: 8, cumulative_steps: 8, save_checkpoint: false, run_validation: false,
             run_quantized_validation: false, lr_start: 0.0, lr_end: 0.0,
         }];
-        assert_eq!(schedule.lr_for_step(&args, 0, 64), rate(&args, 1, 8));
+        assert_eq!(schedule.lr_for_step(&args, 0, 64), rate(&args, 0, 8));
         schedule.chunks[0].epoch = 2;
         schedule.chunks[0].superbatch = 1;
         assert_eq!(schedule.lr_for_step(&args, 0, 64), args.lr);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn warmup_epoch_zero_schedule_and_checkpoint_resume() {
+        let tmp = std::env::temp_dir().join(format!("bulletou-warmup0-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "teacher.psv",
+            "--arch", "SFNN_halfka2_1024_8_64_progress8", "--output", tmp.to_str().unwrap(),
+            "--superbatches", "2", "--max-epochs", "2", "--warmup-sb", "4",
+            "--positions-per-superbatch", "512", "--batch-size", "64", "--save-rate", "1",
+            "--batches-per-update", "2", "--lr", "0.001", "--lr-min", "0.00001"]).unwrap();
+        let full = cuda_cpp_run_schedule(&args).unwrap();
+        assert_eq!(full.total_steps, (4 + 2*2)*8);
+        assert_eq!(full.progress_for_step(1).unwrap().display(), "epoch=0 sb=1/4 batch=1/8");
+        assert_eq!(full.progress_for_step(33).unwrap().display(), "epoch=1 sb=1/2 batch=1/8");
+        assert_eq!(full.lr_for_step(&args, 30, 64), args.lr);
+        assert_eq!(full.lr_for_step(&args, 32, 64), args.lr);
+        assert!(full.chunks.iter().find(|c| c.epoch == 0 && c.superbatch == 4).unwrap().save_checkpoint);
+        let checkpoint = tmp.join("0001");
+        std::fs::create_dir_all(&checkpoint).unwrap();
+        std::fs::write(checkpoint.join("state.bin"), b"state").unwrap();
+        std::fs::write(checkpoint.join("dataloader_pos.txt"), "1024,0\n").unwrap();
+        args.resume = true;
+        for (epoch, sb, next_epoch, next_sb) in [(0,2,0,3), (0,4,1,1), (1,2,2,1)] {
+            std::fs::write(checkpoint.join("learn.log"), format!("{LEARN_LOG_HEADER}\nSFNN_HALFKA2,{}, {},1,0.6,0.1,0.5,0.2,0.1,0.1,1,1024,teacher.psv\n", epoch, sb).replace(", ", ",")).unwrap();
+            let resumed = cuda_cpp_run_schedule(&args).unwrap();
+            assert_eq!((resumed.chunks[0].epoch, resumed.chunks[0].superbatch), (next_epoch, next_sb));
+            if epoch == 0 && sb == 2 {
+                assert_eq!(resumed.lr_for_step(&args, 0, 64), full.lr_for_step(&args, 16, 64));
+            }
+        }
+        args.epoch_settings_json = Some(r#"{"lr":{"epoch1":0.001,"epoch2":0.0002}}"#.into());
+        assert_eq!(args_at_epoch(&args, 0).unwrap().lr, 0.001);
+        assert_eq!(args_at_epoch(&args, 2).unwrap().lr, 0.0002);
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
