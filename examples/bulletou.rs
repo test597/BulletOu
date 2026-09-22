@@ -18932,6 +18932,7 @@ struct CudaCppSfnnResidentValidationCache {
     workspaces: Vec<bulletou_cuda_cpp::SfnnForwardWorkspace>,
     outputs: Vec<f32>,
     diagnostics_scratch: Option<bulletou_cuda_cpp::F32Buffer>,
+    unit_diagnostics: Option<bulletou_cuda_cpp::SfnnUnitSaturationStats>,
     quantized_diagnostics: Option<[f64; 5]>,
     progress_params: Option<ShogiSfnnProgressQ16Params>,
 }
@@ -19043,6 +19044,7 @@ impl CudaCppSfnnResidentValidationCache {
             workspaces,
             outputs: vec![0.0; output_len],
             diagnostics_scratch: None,
+            unit_diagnostics: None,
             quantized_diagnostics: None,
             progress_params: progress_params.cloned(),
         }))
@@ -19090,6 +19092,11 @@ impl CudaCppSfnnResidentValidationCache {
             self.diagnostics_scratch = Some(bulletou_cuda_cpp::F32Buffer::new(ctx, 1280).map_err(|e| e.to_string())?);
         }
         let mut totals = [0.0f64; 5];
+        if self.unit_diagnostics.is_none() {
+            self.unit_diagnostics = Some(bulletou_cuda_cpp::SfnnUnitSaturationStats::new(ctx, weights.shape).map_err(|e| e.to_string())?);
+        }
+        let unit_stats = self.unit_diagnostics.as_mut().unwrap();
+        unit_stats.reset();
         let mut offset = 0usize;
         for chunk in &self.chunks {
             let workspace = &self.workspaces[chunk.workspace_index];
@@ -19105,6 +19112,7 @@ impl CudaCppSfnnResidentValidationCache {
             let sums = workspace.validation_stats(ctx, self.diagnostics_scratch.as_ref().unwrap())
                 .map_err(|e| e.to_string())?;
             for (total, sum) in totals.iter_mut().zip(sums) { *total += sum; }
+            unit_stats.accumulate(ctx, workspace, &chunk.device_batch.buckets).map_err(|e| e.to_string())?;
             let end = offset
                 .checked_add(chunk.batch_size)
                 .ok_or_else(|| "SFNN quantized proxy validation output offset overflow".to_string())?;
@@ -19129,6 +19137,7 @@ impl CudaCppSfnnResidentValidationCache {
         self.quantized_diagnostics = Some(diagnostics);
         eprintln!("  [qstats] mode=gpu ft_upper={:.4}% l1_upper={:.4}% l1_square_upper={:.4}% l2_upper={:.4}% output_raw_rms={:.3}",
             diagnostics[0]*100.0, diagnostics[1]*100.0, diagnostics[2]*100.0, diagnostics[3]*100.0, diagnostics[4]);
+        eprintln!("  [qstats-unit] mode=gpu {}", unit_stats.summary());
         Ok(run_one_test_pass(self.cache.as_ref(), args, &self.outputs))
     }
 }

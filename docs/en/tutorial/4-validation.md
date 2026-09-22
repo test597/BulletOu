@@ -192,6 +192,21 @@ SFNN GPU quantized validation automatically aggregates the existing qacc/qloss f
 
 Upper ratios count activation elements reaching the upper bound of 1, not clipped weights. They cover the elements actually used by all validation positions. CSV ratios are 0–1 (0.08456 means 8.456%); stdout `[qstats] mode=gpu` displays percentages. Aggregation weights batches by their actual element counts, including a short final batch.
 
+GPU qvalid also prints `[qstats-unit]`: **maximum per-unit upper saturation rates** for
+`ft_unit_upper_max`, `l1_unit_upper_max`, `l1_square_unit_upper_max`, and `l2_unit_upper_max`.
+FT combines both perspectives (denominator `2 × positions`). L1/L2 use each bucket's
+position count as denominator. L1's linear skip output is excluded. Counts are summed
+over the entire validation set before taking the maximum, not maximized per batch.
+
+Example: `l1_unit_upper_max=100.0000%(bucket=2,unit=6,hits=34,n=34)`.
+Bucket/unit IDs are zero-based; `hits` is the upper-hit count and `n` the denominator.
+FT reports `bucket=shared`. Unseen buckets are excluded; rare buckets are not.
+Ties select the first bucket/unit. A rate of 100% means constant 1 on the observed
+validation positions for that bucket, not proof of a constant over every possible position.
+L3 is linear without an activation clamp, so it reports `l3_unit_upper_max=n/a(no-clamp)`.
+These diagnostics apply to quantized GPU forward, not ordinary f32 validation or CPU qvalid.
+Existing averages and CSV columns remain unchanged, as do weights and optimizer updates.
+
 The five columns follow `batches_per_update` and precede the final `checkpoint` column. The acc/loss/qacc/qloss order is unchanged. New diagnostic cells remain empty for unmeasured sb, historical rows, unsupported architectures and CPU-exact validation. Existing CSVs migrate by column name at the next write, preserving existing values; historical diagnostics are not inferred from current weights.
 
 These are **GPU approximate-validation diagnostics**, not exact integer-engine measurements. Layer rounding differs from CPU-exact inference; compare results from the same path.

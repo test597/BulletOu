@@ -2079,6 +2079,36 @@ __global__ void sfnn_validation_stats_kernel(
     if (threadIdx.x == 0) partials[metric * 256 + blockIdx.x] = scratch[0];
 }
 
+// Per-chunk integer counts. FT is shared; later units are bucket-specific.
+// Tile FT over positions to avoid an atomic for every activation.
+__global__ void sfnn_unit_ft_stats_kernel(const float* stm, const float* nstm,
+    int* counts, size_t batch, size_t ft) {
+    size_t unit = blockIdx.x * blockDim.x + threadIdx.x;
+    if (unit >= ft) return;
+    int count = 0;
+    size_t end = min(batch, (size_t(blockIdx.y) + 1) * 256);
+    for (size_t p = size_t(blockIdx.y) * 256; p < end; ++p)
+        count += int(stm[p * ft + unit] >= 1.0f) + int(nstm[p * ft + unit] >= 1.0f);
+    if (count) atomicAdd(counts + unit, count);
+}
+
+__global__ void sfnn_unit_dense_stats_kernel(const float* input, const float* l2,
+    const int* buckets, int* counts, size_t batch, size_t ft, size_t hidden,
+    size_t width, size_t stacks) {
+    size_t p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= batch) return;
+    int b = buckets[p];
+    if (b < 0 || size_t(b) >= stacks) return;
+    int* row = counts + ft + size_t(b) * (1 + 2 * hidden + width);
+    atomicAdd(row, 1);
+    for (size_t u = 0; u < hidden; ++u) {
+        if (input[p * 2 * hidden + hidden + u] >= 1.0f) atomicAdd(row + 1 + u, 1);
+        if (input[p * 2 * hidden + u] >= 1.0f) atomicAdd(row + 1 + hidden + u, 1);
+    }
+    for (size_t u = 0; u < width; ++u)
+        if (l2[p * width + u] >= 1.0f) atomicAdd(row + 1 + 2 * hidden + u, 1);
+}
+
 __device__ float loss_sigmoid(float value) {
     float exp_neg = expf(-value);
     return 1.0f / (1.0f + exp_neg);
@@ -10870,6 +10900,35 @@ extern "C" int bulletou_cuda_cpp_sfnn_validation_stats(
         stm->ptr, nstm->ptr, l2_input->ptr, l2->ptr, output->ptr, partials->ptr,
         batch, ft, hidden, l2_size);
     return check_kernel_launch("sfnn_validation_stats_kernel launch");
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_unit_stats(
+    BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* stm,
+    BulletOuCudaCppF32Buffer* nstm, BulletOuCudaCppF32Buffer* input,
+    BulletOuCudaCppF32Buffer* l2, BulletOuCudaCppI32Buffer* buckets,
+    BulletOuCudaCppI32Buffer* counts, size_t batch, size_t ft,
+    size_t hidden, size_t width, size_t stacks) {
+    if (set_context_device(ctx) != 0) return -1;
+    if (!batch || batch > 1048576 || !ft || !hidden || !width || !stacks ||
+        ft > SIZE_MAX / batch || hidden > SIZE_MAX / batch / 2 || width > SIZE_MAX / batch ||
+        hidden > (SIZE_MAX - 1 - width) / 2)
+        return fail_message("invalid unit stats dimensions");
+    size_t stride = 1 + 2 * hidden + width;
+    if (stacks > (SIZE_MAX / sizeof(int) - ft) / stride)
+        return fail_message("unit stats size overflow");
+    size_t len = ft + stacks * stride;
+    if (validate_buffer(ctx, stm, batch*ft, "unit stats stm") != 0 ||
+        validate_buffer(ctx, nstm, batch*ft, "unit stats nstm") != 0 ||
+        validate_buffer(ctx, input, batch*2*hidden, "unit stats input") != 0 ||
+        validate_buffer(ctx, l2, batch*width, "unit stats l2") != 0 ||
+        validate_i32_buffer(ctx, buckets, batch, "unit stats buckets") != 0 ||
+        validate_i32_buffer(ctx, counts, len, "unit stats counts") != 0) return -1;
+    cudaError_t status = cudaMemsetAsync(counts->ptr, 0, len*sizeof(int), ctx->stream);
+    if (status != cudaSuccess) return fail("clear unit stats", status);
+    sfnn_unit_ft_stats_kernel<<<dim3((ft+255)/256, (batch+255)/256),256,0,ctx->stream>>>(stm->ptr,nstm->ptr,counts->ptr,batch,ft);
+    if (check_kernel_launch("unit FT stats") != 0) return -1;
+    sfnn_unit_dense_stats_kernel<<<(batch+255)/256,256,0,ctx->stream>>>(input->ptr,l2->ptr,buckets->ptr,counts->ptr,batch,ft,hidden,width,stacks);
+    return check_kernel_launch("unit dense stats");
 }
 
 extern "C" int bulletou_cuda_cpp_axpy_host(

@@ -192,6 +192,19 @@ SFNNのGPU量子化後検証では、qacc/qlossと同じforwardの中間値を�
 
 上限到達率は、検証した全局面で使用した要素のうち活性化上限1に到達した要素の割合です。重み自体のclipping率ではありません。CSVでは0〜1の割合（0.08456なら8.456%）、stdoutの `[qstats] mode=gpu` 行では百分率で表示します。最終batchが小さい場合も局面数・要素数で加重して集計します。
 
+さらにGPU qvalidでは `[qstats-unit]` 行に、unit別上限到達率の**最大値**を表示します。
+`ft_unit_upper_max`、`l1_unit_upper_max`、`l1_square_unit_upper_max`、`l2_unit_upper_max` が対象です。
+FTは両視点を合わせた全検証局面（母数 `2 × 局面数`）、L1/L2は各bucketを使用した局面を母数にしてunitごとの率を求め、その最大を選びます。L1のskip出力は対象外です。
+batchごとの最大値ではなく、検証全体の回数を合算してから計算します。
+
+表示例: `l1_unit_upper_max=100.0000%(bucket=2,unit=6,hits=34,n=34)`。
+bucket/unit番号は0始まり、`hits`は上限到達回数、`n`は母数です。FTのbucket表示は`shared`です。
+未出現bucketは除外しますが、少数局面のbucketは除外しません。同率なら最初のbucket/unitを表示します。
+100%は**今回検証した該当局面で**定数1だったことを意味し、あらゆる局面で定数だと証明するものではありません。
+L3はclampのない線形出力なので `l3_unit_upper_max=n/a(no-clamp)` と表示します。
+これは量子化GPU forwardの診断で、通常のf32 validationやCPU qvalidへの追加ではありません。
+既存の平均値とCSV列はそのままです。学習更新式・重み・optimizer stateは変更しません。
+
 列は既存のacc/loss/qacc/qlossの順序を変えず、`batches_per_update` と末尾の `checkpoint` の間に追加します。qvalid未実施sb、過去の未計測行、対象外arch、CPU厳密検証時の新しい診断列は空欄です。既存CSVは次回書き込み時に列名で移行し、既存値を保持します。過去の値を現在のモデルで埋め直しません。
 
 これらは**GPU簡易検証の値**です。CPU整数推論の丸めを全層で再現するものではなく、別途CPUで測定した飽和率・raw RMSとは差が生じ得ます。比較時は計算経路をそろえてください。

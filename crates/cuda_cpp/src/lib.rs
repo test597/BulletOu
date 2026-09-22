@@ -1888,6 +1888,9 @@ pub struct SfnnForwardWorkspace {
     qat_l1_active: std::cell::Cell<bool>,
 }
 
+mod unit_saturation_stats;
+pub use unit_saturation_stats::SfnnUnitSaturationStats;
+
 impl SfnnForwardWorkspace {
     /// Sum of FT/L1-normal/L1-square/L2 upper counts and normalized output squares.
     /// Caller reuses 1280 floats of scratch; all intermediate activations stay on GPU.
@@ -9085,6 +9088,13 @@ mod ffi {
             l2_input: *mut BulletOuCudaCppF32Buffer, l2: *mut BulletOuCudaCppF32Buffer,
             output: *mut BulletOuCudaCppF32Buffer, partials: *mut BulletOuCudaCppF32Buffer,
             batch: usize, ft: usize, hidden: usize, l2_size: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_unit_stats(
+            ctx: *mut BulletOuCudaCppContext,
+            stm: *mut BulletOuCudaCppF32Buffer, nstm: *mut BulletOuCudaCppF32Buffer,
+            input: *mut BulletOuCudaCppF32Buffer, l2: *mut BulletOuCudaCppF32Buffer,
+            buckets: *mut BulletOuCudaCppI32Buffer, counts: *mut BulletOuCudaCppI32Buffer,
+            batch: usize, ft: usize, hidden: usize, width: usize, stacks: usize,
         ) -> i32;
         pub fn bulletou_cuda_cpp_last_error(out: *mut c_char, out_len: usize) -> i32;
         pub fn bulletou_cuda_cpp_device_name(device: i32, out: *mut c_char, out_len: usize) -> i32;
