@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,24 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_trial_warning_color_is_console_only(self):
+        line = "  WARN: clipping disabled\n"
+        with patch.dict(os.environ, {"BULLETOU_COLOR": "always"}, clear=True):
+            self.assertEqual(grid.trial_console_line(1, line),
+                             "\x1b[1;33m[TRIAL 1]   WARN: clipping disabled\x1b[0m\n")
+            self.assertEqual(grid.trial_console_line(1, "train\n"), "[TRIAL 1] train\n")
+            with patch.dict(os.environ, {"NO_COLOR": "1"}):
+                self.assertEqual(grid.trial_console_line(1, line), "[TRIAL 1] " + line)
+        with patch.dict(os.environ, {}, clear=True), patch.object(sys.stdout, "isatty", return_value=False):
+            self.assertEqual(grid.trial_console_line(1, line), "[TRIAL 1] " + line)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"BULLETOU_COLOR": "always"}, clear=True):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code, _ = grid.run_child([sys.executable, "-c", "print('  WARN: clipping disabled')"], Path(tmp), tmp, 1)
+            self.assertEqual(code, 0)
+            self.assertIn("\x1b[1;33m", output.getvalue())
+            self.assertNotIn("\x1b", (Path(tmp) / "stdout.log").read_text(encoding="utf-8"))
+
     def test_warmup_sb_grid(self):
         plan = self.plan(["--grid", "warmup_sb", "0", "1"])
         self.assertEqual({t["settings"]["warmup_sb"] for t in plan["trials"]}, {0, 1})

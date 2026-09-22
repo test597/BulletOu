@@ -704,6 +704,17 @@ def stop_child(proc: subprocess.Popen) -> None:
             proc.wait(timeout=15)
 
 
+def trial_console_line(trial_id: int, line: str) -> str:
+    text = f"[TRIAL {trial_id}] {line}"
+    color_mode = os.environ.get("BULLETOU_COLOR", "auto").lower()
+    color = ("NO_COLOR" not in os.environ and color_mode != "never"
+             and (color_mode == "always" or (sys.stdout.isatty() and os.environ.get("TERM") != "dumb")))
+    if color and re.match(r"\s*(?:WARN(?:ING)?:|\[WARN(?:ING)?\])", line):
+        ending = "\n" if text.endswith("\n") else ""
+        return "\x1b[1;33m" + text.rstrip("\n") + "\x1b[0m" + ending
+    return text
+
+
 def run_child(command: list[str], directory: Path, cwd: str, trial_id: int) -> tuple[int, float]:
     start = time.monotonic()
     # Append so interrupted attempts remain inspectable, including settings/build
@@ -714,7 +725,7 @@ def run_child(command: list[str], directory: Path, cwd: str, trial_id: int) -> t
                               text=True, encoding="utf-8", errors="replace", bufsize=1) as proc:
             try:
                 for line in proc.stdout:
-                    print(f"[TRIAL {trial_id}] {line}", end="", flush=True)
+                    print(trial_console_line(trial_id, line), end="", flush=True)
                     log.write(line)
                 code = proc.wait()
             except BaseException:
