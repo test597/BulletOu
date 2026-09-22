@@ -3373,6 +3373,7 @@ pub fn sfnn_backward_device_with_factorizer_and_alpha(
         factorizer_alpha,
         None,
         None,
+        None,
     )
 }
 
@@ -3438,6 +3439,7 @@ pub fn sfnn_backward_train_device_with_factorizer_and_alpha(
         factorizer_alpha,
         None,
         None,
+        None,
     )
 }
 
@@ -3453,6 +3455,7 @@ fn sfnn_backward_train_device_with_factorizer_alpha_and_axis_confidences(
     factorizer_alpha: SfnnFactorizerAlpha,
     residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
+    entry_weights: &F32Buffer,
 ) -> Result<()> {
     sfnn_backward_device_impl(
         ctx,
@@ -3466,6 +3469,7 @@ fn sfnn_backward_train_device_with_factorizer_alpha_and_axis_confidences(
         factorizer_alpha,
         residual_count_gates,
         factorizer_axis_confidences,
+        Some(entry_weights),
     )
 }
 
@@ -3739,8 +3743,10 @@ fn sfnn_backward_device_impl(
     factorizer_alpha: SfnnFactorizerAlpha,
     residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
+    entry_weights: Option<&F32Buffer>,
 ) -> Result<()> {
     batch.validate()?;
+    if let Some(w) = entry_weights { expect_len("backward entry weights", batch.batch_size, w.len())?; }
     weights.validate()?;
     forward.validate()?;
     loss.validate()?;
@@ -3906,6 +3912,7 @@ fn sfnn_backward_device_impl(
                 backward.l3axw_gradients.as_ptr(),
                 backward.l3axb_gradients.as_ptr(),
                 0,
+                entry_weights.map_or(std::ptr::null_mut(), |w| w.as_ptr()),
             )
         } else {
             ffi::bulletou_cuda_cpp_sfnn_backward_device(
@@ -6081,6 +6088,7 @@ impl SfnnTrainStepUploadSlot {
 
 #[derive(Debug)]
 pub struct SfnnTrainStepRunner {
+    experimental_output_centers: Option<(F32Buffer, F32Buffer)>,
     pub shape: SfnnForwardShape,
     pub batch_size: usize,
     pub max_active: usize,
@@ -6407,6 +6415,9 @@ impl SfnnTrainStepRunner {
             optimizer_states,
             factorizer,
             factorizer_alpha,
+            experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu") {
+                Some((F32Buffer::new(ctx, 32 * shape.l2_in())?, F32Buffer::new(ctx, 32 * shape.l2_size)?))
+            } else { None },
             forward_workspace: SfnnForwardWorkspace::new(ctx, SfnnForwardWorkspaceLayout::new(shape, batch_size))?,
             loss_workspace: ScalarLossWorkspace::new(ctx, ScalarLossWorkspaceLayout::new(batch_size))?,
             backward_workspace,
@@ -7125,6 +7136,7 @@ impl SfnnTrainStepRunner {
             self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
+        experimental_recycle::maybe_recycle(self, ctx, &self.device_batch, &self.entry_weights, params.radam.step, update_weights)?;
         scalar_loss_device_from_buffers_with_finalize(
             ctx,
             loss_kind,
@@ -7147,6 +7159,7 @@ impl SfnnTrainStepRunner {
             self.factorizer_alpha,
             self.residual_count_gates(),
             self.factorizer_axis_confidences(),
+            &self.entry_weights,
         )?;
         if update_weights {
             self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
@@ -7293,6 +7306,7 @@ impl SfnnTrainStepRunner {
                 self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
             )?;
+            experimental_recycle::maybe_recycle(self, ctx, &slot.device_batch, &slot.entry_weights, params.radam.step, update_weights)?;
             scalar_loss_device_from_buffers_with_finalize(
                 ctx,
                 loss_kind,
@@ -7315,6 +7329,7 @@ impl SfnnTrainStepRunner {
                 self.factorizer_alpha,
                 self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
+                &slot.entry_weights,
             )?;
         }
         if update_weights {
@@ -8015,6 +8030,20 @@ impl SfnnTrainStepRunner {
         let l1_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L1)?;
         let l2_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L2)?;
         let l3_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L3)?;
+        let experiment_projection = experimental_l1_project::capture(self, ctx)?;
+        let experiment_output_center = experimental_output_center::capture(self, ctx, params, lr_multipliers)?;
+        if let Some(c) = &experiment_output_center {
+            experimental_output_center::transform(self, ctx, c, true)?;
+        }
+        let experiment_center = experimental_l1_center::center(self, ctx)?;
+        if let Some(c) = &experiment_center {
+            if lr_multipliers.tatara_weight_clip || params.radam.decay != 0.0 || lr_multipliers.norm_loss_strength != 0.0
+                || lr_multipliers.factorizer_residual_decay != 0.0 || lr_multipliers.saturation_penalty != 0.0
+                || params.radam.min_weight > -1e20 || params.radam.max_weight < 1e20 {
+                return Err(CudaCppError::message("centering experiment requires optimizer clipping/decay/norm loss disabled"));
+            }
+            experimental_l1_center::transform(self, ctx, c, true)?;
+        }
         update_param_group_with_lr_multiplier(
             ctx,
             lr_multipliers.clip_params(params, SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight),
@@ -8096,6 +8125,12 @@ impl SfnnTrainStepRunner {
             (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
             _ => return Err(CudaCppError::message("SFNN weight/state l1axw/l1axb optional groups mismatch")),
+        }
+        if let Some(c) = &experiment_center {
+            experimental_l1_center::transform(self, ctx, c, false)?;
+        }
+        if let Some(s) = &experiment_projection {
+            experimental_l1_project::apply(self, ctx, s)?;
         }
         update_stacked_param_group_with_lr_multiplier(
             ctx,
@@ -8228,6 +8263,9 @@ impl SfnnTrainStepRunner {
             (Some(_), Some(_), Some(_), Some(_)) => {}
             (None, None, None, None) => {}
             _ => return Err(CudaCppError::message("SFNN weight/state l3axw/l3axb optional groups mismatch")),
+        }
+        if let Some(c) = &experiment_output_center {
+            experimental_output_center::transform(self, ctx, c, false)?;
         }
         Ok(())
     }
@@ -8984,6 +9022,10 @@ fn check(code: i32) -> Result<()> {
     if code == 0 { Ok(()) } else { Err(CudaCppError::from_last_error(code)) }
 }
 
+mod experimental_l1_center;
+mod experimental_recycle;
+mod experimental_l1_project;
+mod experimental_output_center;
 mod ffi {
     use super::c_char;
 
@@ -9023,6 +9065,20 @@ mod ffi {
     }
 
     unsafe extern "C" {
+        #[cfg(test)]
+        pub fn bulletou_experiment_mean_penalty_test(ctx: *mut BulletOuCudaCppContext,
+            z: *mut BulletOuCudaCppF32Buffer, buckets: *mut BulletOuCudaCppI32Buffer,
+            weights: *mut BulletOuCudaCppF32Buffer,
+            grad: *mut BulletOuCudaCppF32Buffer, batch: usize, hidden: usize, stride: usize,
+            stacks: usize, strength: f32) -> i32;
+        pub fn bulletou_experiment_center_affine(ctx: *mut BulletOuCudaCppContext,
+            w: *mut BulletOuCudaCppF32Buffer, b: *mut BulletOuCudaCppF32Buffer,
+            sw: *mut BulletOuCudaCppF32Buffer, sb: *mut BulletOuCudaCppF32Buffer,
+            gw: *mut BulletOuCudaCppF32Buffer, gb: *mut BulletOuCudaCppF32Buffer,
+            c: *mut BulletOuCudaCppF32Buffer, rows: usize, cols: usize, before: i32) -> i32;
+        pub fn bulletou_experiment_column_mean(ctx: *mut BulletOuCudaCppContext,
+            input: *mut BulletOuCudaCppF32Buffer, scratch: *mut BulletOuCudaCppF32Buffer,
+            rows: usize, cols: usize) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_validation_stats(
             ctx: *mut BulletOuCudaCppContext,
             stm: *mut BulletOuCudaCppF32Buffer, nstm: *mut BulletOuCudaCppF32Buffer,
@@ -9644,6 +9700,7 @@ mod ffi {
             l3axw_gradients: *mut BulletOuCudaCppF32Buffer,
             l3axb_gradients: *mut BulletOuCudaCppF32Buffer,
             zero_parameter_gradients: i32,
+            entry_weights: *mut BulletOuCudaCppF32Buffer,
         ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_backward_train_profile_device(
             ctx: *mut BulletOuCudaCppContext,
@@ -11465,7 +11522,7 @@ mod tests {
         }
     }
 
-    fn tiny_sfnn_shape() -> SfnnForwardShape {
+    pub(super) fn tiny_sfnn_shape() -> SfnnForwardShape {
         SfnnForwardShape {
             input_size: 4,
             ft_size: 4,
@@ -11485,7 +11542,7 @@ mod tests {
         }
     }
 
-    fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static> {
+    pub(super) fn tiny_sfnn_weights(shape: SfnnForwardShape) -> SfnnForwardHostWeights<'static> {
         assert_eq!(shape, tiny_sfnn_shape());
         SfnnForwardHostWeights {
             shape,

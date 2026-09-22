@@ -10,6 +10,51 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <cstdlib>
+
+// Auxiliary loss: strength * sum_b(sum_weights_b/N) * mean_u relu(abs(weighted_mean_b z_u)-0.9)^2.
+// Zero-weight records do not participate; normalization matches task loss (batch size N).
+// It constrains a unit's population mean, NOT every individual activation.
+__global__ void experiment_l1_mean_penalty(const float* z, const int* buckets, const float* entry_weights, float* grad,
+    size_t batch, size_t hidden, size_t stride, float strength) {
+    const size_t unit = blockIdx.x % hidden;
+    const int bucket = static_cast<int>(blockIdx.x / hidden);
+    __shared__ float sums[256];
+    __shared__ float counts[256];
+    float sum = 0.0f; float count = 0.0f;
+    for (size_t i = threadIdx.x; i < batch; i += 256) {
+        if (buckets[i] == bucket && entry_weights[i] > 0.0f) {
+            sum += entry_weights[i] * z[i*stride+unit]; count += entry_weights[i];
+        }
+    }
+    sums[threadIdx.x] = sum; counts[threadIdx.x] = count;
+    __syncthreads();
+    for (int d=128; d>0; d/=2) {
+        if (threadIdx.x < d) { sums[threadIdx.x] += sums[threadIdx.x+d]; counts[threadIdx.x] += counts[threadIdx.x+d]; }
+        __syncthreads();
+    }
+    float mean = counts[0] ? sums[0]/counts[0] : 0.0f;
+    float g = 2.0f * strength * copysignf(fmaxf(fabsf(mean)-0.9f,0.0f),mean) / (batch*hidden);
+    for (size_t i = threadIdx.x; i < batch; i += 256) {
+        if (buckets[i] == bucket && entry_weights[i] > 0.0f) grad[i*stride+unit] += entry_weights[i] * g;
+    }
+}
+
+// Experimental L1 centering reduction, never used by default training.
+__global__ void experiment_mean_partial(const float* x, float* scratch, size_t rows, size_t cols) {
+    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    float sum = 0.0f;
+    for (size_t row = blockIdx.y; row < rows; row += 32) sum += x[row * cols + col];
+    scratch[blockIdx.y * cols + col] = sum;
+}
+__global__ void experiment_mean_finish(float* scratch, size_t rows, size_t cols) {
+    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    float sum = 0.0f;
+    for (size_t p = 0; p < 32; ++p) sum += scratch[p * cols + col];
+    scratch[col] = sum / static_cast<float>(rows);
+}
 
 namespace {
 
@@ -6060,7 +6105,8 @@ int launch_sfnn_backward_kernels(
     int zero_parameter_gradients,
     int fuse_pairwise_l0,
     float* profile_ms,
-    size_t profile_ms_len) {
+    size_t profile_ms_len,
+    const float* entry_weights = nullptr) {
     if (validate_sfnn_shape(
             input_size,
             ft_size,
@@ -6403,6 +6449,24 @@ int launch_sfnn_backward_kernels(
         l1, l2_input, l2_input_gradients, l1_gradients, batch, l1_hidden, l1_skip);
     if (check_kernel_launch("sfnn_l2_input_backward_kernel launch") != 0) {
         return -1;
+    }
+    if (const char* raw = std::getenv("BULLETOU_EXPERIMENT_L1_MEAN_PENALTY")) {
+        char* end = nullptr;
+        float strength = std::strtof(raw, &end);
+        if (end == raw || *end != '\0' || !std::isfinite(strength) || strength < 0.0f || num_stacks > 256) {
+            return fail_message("invalid experimental L1 mean penalty (limited to <=256 stacks)");
+        }
+        static bool announced = false;
+        if (!announced) {
+            std::fprintf(stderr,"  EXPERIMENT L1 mean penalty = %g, mean threshold=0.9; auxiliary loss excluded from reported task loss\n",strength);
+            announced = true;
+        }
+        if (strength > 0.0f) {
+            if (!entry_weights) return fail_message("experimental mean penalty requires explicit entry weights; this backward path is unsupported");
+            experiment_l1_mean_penalty<<<num_stacks*l1_hidden,256,0,ctx->stream>>>(
+                l1,buckets,entry_weights,l1_gradients,batch,l1_hidden,l1_out,strength);
+            if (check_kernel_launch("experimental L1 mean penalty") != 0) return -1;
+        }
     }
     if (profile.record(4, ctx, "SFNN backward profile after L2 input") != 0) {
         return -1;
@@ -9963,7 +10027,8 @@ int sfnn_backward_train_device_impl(
     BulletOuCudaCppF32Buffer* l3axb_gradients,
     int zero_parameter_gradients,
     float* profile_ms,
-    size_t profile_ms_len) {
+    size_t profile_ms_len,
+    const float* entry_weights = nullptr) {
     const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     const size_t l2_in = l1_hidden * 2;
     const size_t axis_count = sfnn_factorizer_axis_count(
@@ -10174,7 +10239,8 @@ int sfnn_backward_train_device_impl(
             zero_parameter_gradients,
             1,
             profile_ms,
-            profile_ms_len) != 0) {
+            profile_ms_len,
+            entry_weights) != 0) {
         return -1;
     }
 
@@ -10264,7 +10330,9 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     BulletOuCudaCppF32Buffer* l3fb_gradients,
     BulletOuCudaCppF32Buffer* l3axw_gradients,
     BulletOuCudaCppF32Buffer* l3axb_gradients,
-    int zero_parameter_gradients) {
+    int zero_parameter_gradients,
+    BulletOuCudaCppF32Buffer* entry_weights) {
+    if (entry_weights && validate_buffer(ctx, entry_weights, batch, "backward entry weights") != 0) return -1;
     const size_t axis_count = sfnn_factorizer_axis_count(
         num_stacks,
         factorizer_king_axis_dim,
@@ -10373,7 +10441,8 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         l3axb_gradients,
         zero_parameter_gradients,
         nullptr,
-        0);
+        0,
+        entry_weights ? entry_weights->ptr : nullptr);
 }
 
 extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
@@ -10926,6 +10995,62 @@ extern "C" int bulletou_cuda_cpp_rebase_shared_device(
         shared->ptr + shared_offset, shared_slow->ptr + shared_offset,
         shared_m->ptr + shared_offset, shared_v->ptr + shared_offset, shared_count, ratio);
     return check_kernel_launch("shared rebase scale");
+}
+
+__global__ void experiment_center_affine_kernel(float* w, float* b, float* sw, float* sb,
+    float* gw, const float* gb, const float* c, size_t cols, bool before) {
+    __shared__ float fast[256];
+    __shared__ float slow[256];
+    const size_t row=blockIdx.x, j=threadIdx.x, i=row*cols+j;
+    float f=0.0f,s=0.0f;
+    if(j<cols) {
+        f=w[i]*c[j]; s=sw[i]*c[j];
+        if(before) gw[i]-=gb[row]*c[j];
+    }
+    fast[j]=f; slow[j]=s; __syncthreads();
+    for(unsigned step=128;step;step>>=1) {
+        if(j<step) {fast[j]+=fast[j+step];slow[j]+=slow[j+step];}
+        __syncthreads();
+    }
+    if(j==0) {const float sign=before?1.0f:-1.0f;b[row]+=sign*fast[0];sb[row]+=sign*slow[0];}
+}
+
+extern "C" int bulletou_experiment_center_affine(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w, BulletOuCudaCppF32Buffer* b,
+    BulletOuCudaCppF32Buffer* sw, BulletOuCudaCppF32Buffer* sb,
+    BulletOuCudaCppF32Buffer* gw, BulletOuCudaCppF32Buffer* gb,
+    BulletOuCudaCppF32Buffer* c, size_t rows, size_t cols, int before) {
+    if(rows==0 || cols==0 || cols>256 || rows>65536 || rows>SIZE_MAX/cols ||
+       validate_buffer(ctx,w,rows*cols,"center w")!=0 || validate_buffer(ctx,b,rows,"center b")!=0 ||
+       validate_buffer(ctx,sw,rows*cols,"center slow w")!=0 || validate_buffer(ctx,sb,rows,"center slow b")!=0 ||
+       validate_buffer(ctx,gw,rows*cols,"center gw")!=0 || validate_buffer(ctx,gb,rows,"center gb")!=0 ||
+       validate_buffer(ctx,c,cols,"center c")!=0) return -1;
+    experiment_center_affine_kernel<<<static_cast<unsigned>(rows),256,0,ctx->stream>>>(
+        w->ptr,b->ptr,sw->ptr,sb->ptr,gw->ptr,gb->ptr,c->ptr,cols,before!=0);
+    return check_kernel_launch("experimental output centering");
+}
+
+extern "C" int bulletou_experiment_column_mean(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* input, BulletOuCudaCppF32Buffer* scratch, size_t rows, size_t cols) {
+    if (rows == 0 || cols == 0 || cols > 65536 || rows > SIZE_MAX / cols ||
+        validate_buffer(ctx,input,rows*cols,"centering input") != 0 ||
+        validate_buffer(ctx,scratch,32*cols,"centering scratch") != 0) return -1;
+    experiment_mean_partial<<<dim3((cols+255)/256,32),256,0,ctx->stream>>>(input->ptr,scratch->ptr,rows,cols);
+    if (check_kernel_launch("centering partial") != 0) return -1;
+    experiment_mean_finish<<<(cols+255)/256,256,0,ctx->stream>>>(scratch->ptr,rows,cols);
+    return check_kernel_launch("centering finish");
+}
+
+extern "C" int bulletou_experiment_mean_penalty_test(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* z, BulletOuCudaCppI32Buffer* buckets, BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppF32Buffer* grad,
+    size_t batch, size_t hidden, size_t stride, size_t stacks, float strength) {
+    if (batch == 0 || hidden == 0 || stride < hidden || stacks == 0 || stacks > 256 ||
+        validate_buffer(ctx,z,batch*stride,"mean penalty z") != 0 ||
+        validate_buffer(ctx,weights,batch,"mean penalty weights") != 0 ||
+        validate_buffer(ctx,grad,batch*stride,"mean penalty grad") != 0 ||
+        validate_i32_buffer(ctx,buckets,batch,"mean penalty buckets") != 0) return -1;
+    experiment_l1_mean_penalty<<<stacks*hidden,256,0,ctx->stream>>>(z->ptr,buckets->ptr,weights->ptr,grad->ptr,batch,hidden,stride,strength);
+    return check_kernel_launch("mean penalty test");
 }
 
 extern "C" int bulletou_cuda_cpp_ranger_update_host(
