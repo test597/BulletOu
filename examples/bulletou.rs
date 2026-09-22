@@ -5029,8 +5029,14 @@ struct Args {
     #[arg(long = "sfnn-init-bias", value_enum, default_value = "zero")]
     sfnn_init_bias: SfnnInitBiasMode,
 
+    /// Glorot-uniform L2/L3 scratch weights: sqrt(6/(fan_in+fan_out)).
+    /// Default off. FT/L1/biases unchanged; existing init-scale multipliers still apply.
+    #[arg(long)]
+    sfnn_init_l2_l3_glorot: bool,
+
     /// Extra multiplier applied only to SFNN L2/L3 scratch weights. The
-    /// effective half-width is `0.01 * --nnue-pytorch-init-scale * this`.
+    /// effective half-width is `0.01 * --nnue-pytorch-init-scale * this`,
+    /// or `sqrt(6/(fan_in+fan_out)) * init_scale * this` with Glorot enabled.
     /// Default 1.0 gives tatara's [-0.01, 0.01] range without other overrides.
     #[arg(long = "sfnn-init-l2-l3-scale", default_value_t = DEFAULT_SFNN_INIT_L2_L3_SCALE)]
     sfnn_init_l2_l3_scale: f32,
@@ -5295,6 +5301,9 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.sfnn_init_l2_l3_glorot && (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()) {
+            return Err("--sfnn-init-l2-l3-glorot requires --backend cuda-cpp and an SFNN arch".into());
+        }
         if self.sfnn_l2_l3_center {
             if self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack() {
                 return Err("--sfnn-l2-l3-center requires --backend cuda-cpp and an SFNN arch".into());
@@ -5872,6 +5881,15 @@ fn effective_sfnn_init_l2_scale(args: &Args) -> f32 {
 
 fn effective_sfnn_init_l3_scale(args: &Args) -> f32 {
     args.sfnn_init_l3_scale.unwrap_or(args.sfnn_init_l2_l3_scale)
+}
+
+fn sfnn_l2_l3_weight_init_bounds(args: &Args) -> (f32, f32) {
+    let (_, hidden, l2) = args.arch().dims();
+    let (b2, b3) = if args.sfnn_init_l2_l3_glorot {
+        ((6.0 / (2 * hidden + l2) as f32).sqrt(), (6.0 / (l2 + 1) as f32).sqrt())
+    } else { (DEFAULT_SFNN_INIT_HALF_WIDTH, DEFAULT_SFNN_INIT_HALF_WIDTH) };
+    (b2 * args.nnue_pytorch_init_scale * effective_sfnn_init_l2_scale(args),
+     b3 * args.nnue_pytorch_init_scale * effective_sfnn_init_l3_scale(args))
 }
 
 fn effective_fv_scale(args: &Args) -> f32 {
@@ -17223,7 +17241,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "SFNN init",
             format!(
-                "bias={}, dense=uniform[-0.01,0.01] x scale, bucket weights=independent, init_scale={:.3}, l2_scale={:.3}, l3_scale={:.3}, L1 shared=uniform[-0.01,0.01] when enabled",
+                "bias={}, L1=uniform[-0.01,0.01] x scale, bucket weights=independent, init_scale={:.3}, l2_scale={:.3}, l3_scale={:.3}, L1 shared=uniform[-0.01,0.01] when enabled",
                 paint(args.sfnn_init_bias.cli_name(), ConsoleColor::BoldYellow),
                 args.nnue_pytorch_init_scale,
                 effective_sfnn_init_l2_scale(args),
@@ -21065,7 +21083,6 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let input_size = feature_kind.input_size_for_args(args);
     let init_scale = args.nnue_pytorch_init_scale;
     let l2_init_scale = effective_sfnn_init_l2_scale(args);
-    let l3_init_scale = effective_sfnn_init_l3_scale(args);
     let shape = bulletou_cuda_cpp::SfnnForwardShape {
         input_size,
         ft_size,
@@ -21105,10 +21122,13 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
 
     let l1_bound = init_scale * DEFAULT_SFNN_INIT_HALF_WIDTH;
     let l2_bound = l1_bound * l2_init_scale;
-    let l3_bound = l1_bound * l3_init_scale;
+    let (l2_weight_bound, l3_bound) = sfnn_l2_l3_weight_init_bounds(args);
+    print_startup_kv("SFNN L2/L3 init", format!(
+        "{} uniform: L2 +/-{:.9}, L3 +/-{:.9}; scratch weights only; FT/L1/bias unchanged",
+        if args.sfnn_init_l2_l3_glorot { "Glorot" } else { "tatara-style" }, l2_weight_bound, l3_bound));
     let l1w = cuda_cpp_tatara_uniform_abs_init(cuda_cpp_sfnn_l1w_len_for_shape(shape)?, 0x5f11_e003, l1_bound);
     let l1b = cuda_cpp_sfnn_stacked_hidden_bias_init(l1_out, num_stacks, 0x5f11_e004, l1_bound, args.sfnn_init_bias);
-    let l2w = cuda_cpp_tatara_uniform_abs_init(num_stacks * l2_size * l2_in, 0x5f11_e005, l2_bound);
+    let l2w = cuda_cpp_tatara_uniform_abs_init(num_stacks * l2_size * l2_in, 0x5f11_e005, l2_weight_bound);
     let l2b = cuda_cpp_sfnn_stacked_hidden_bias_init(l2_size, num_stacks, 0x5f11_e006, l2_bound, args.sfnn_init_bias);
     let l3w = cuda_cpp_tatara_uniform_abs_init(num_stacks * l2_size, 0x5f11_e007, l3_bound);
     let l3b = vec![0.0; num_stacks];
@@ -25234,6 +25254,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("no_ft_factorize={}", args.no_ft_factorize),
         format!("ft_factorizer_alpha={:.9}", args.ft_factorizer_alpha),
         format!("sfnn_init_bias={}", args.sfnn_init_bias.cli_name()),
+        format!("sfnn_init_l2_l3_glorot={}", args.sfnn_init_l2_l3_glorot),
         format!("sfnn_init_l2_l3_scale={:.9}", args.sfnn_init_l2_l3_scale),
         format!("sfnn_init_l2_scale={:.9}", effective_sfnn_init_l2_scale(args)),
         format!("sfnn_init_l3_scale={:.9}", effective_sfnn_init_l3_scale(args)),
@@ -25411,7 +25432,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "no_ft_factorize=", "nnue_pytorch_init_scale=", "no_ft_factorize=false");
     ensure_line_after(&mut out, "ft_factorizer_alpha=", "no_ft_factorize=", "ft_factorizer_alpha=1.000000000");
     ensure_line_after(&mut out, "sfnn_init_bias=", "ft_factorizer_alpha=", "sfnn_init_bias=zero");
-    ensure_line_after(&mut out, "sfnn_init_l2_l3_scale=", "sfnn_init_bias=", "sfnn_init_l2_l3_scale=0.500000000");
+    ensure_line_after(&mut out, "sfnn_init_l2_l3_glorot=", "sfnn_init_bias=", "sfnn_init_l2_l3_glorot=false");
+    ensure_line_after(&mut out, "sfnn_init_l2_l3_scale=", "sfnn_init_l2_l3_glorot=", "sfnn_init_l2_l3_scale=0.500000000");
     ensure_line_after(&mut out, "sfnn_init_l2_scale=", "sfnn_init_l2_l3_scale=", "sfnn_init_l2_scale=0.500000000");
     ensure_line_after(&mut out, "sfnn_init_l3_scale=", "sfnn_init_l2_scale=", "sfnn_init_l3_scale=0.500000000");
     ensure_line_after(
@@ -33907,6 +33929,36 @@ mod tests {
             enabled.sfnn_norm_loss_strength = invalid;
             assert!(enabled.validate_cuda_cpp_backend_options().is_err());
         }
+    }
+
+    #[test]
+    fn glorot_l2_l3_initialization_cli_json_and_weights() {
+        let mut argv:Vec<std::ffi::OsString>=["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_ka2_32_1_2_k3k3"].map(Into::into).to_vec();
+        let base=Args::try_parse_from(argv.clone()).unwrap();
+        assert!(!base.sfnn_init_l2_l3_glorot);
+        assert_eq!(sfnn_l2_l3_weight_init_bounds(&base),(0.01,0.01));
+        let legacy=resume_signature_without_line(&resume_signature(&base),"sfnn_init_l2_l3_glorot=");
+        assert!(resume_signature_matches(&legacy,&base));
+        bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),"sfnn_init_l2_l3_glorot",&serde_json::json!(true),&mut argv).unwrap();
+        let mut enabled=Args::try_parse_from(argv).unwrap();
+        assert!(enabled.validate_arch_flags().is_ok());
+        assert!(!resume_signature_matches(&legacy,&enabled));
+        let a=build_sfnn_initial_weights_for_cuda_cpp(&base,CudaCppSfnnFeatureKind::Ka2).unwrap();
+        let b=build_sfnn_initial_weights_for_cuda_cpp(&enabled,CudaCppSfnnFeatureKind::Ka2).unwrap();
+        assert_eq!(a.l0w,b.l0w); assert_eq!(a.l1w,b.l1w); assert_eq!(a.l1fw,b.l1fw);
+        assert_eq!(a.l0b,b.l0b); assert_eq!(a.l1b,b.l1b); assert_eq!(a.l2b,b.l2b); assert_eq!(a.l3b,b.l3b);
+        let (bound2,bound3)=sfnn_l2_l3_weight_init_bounds(&enabled);
+        assert!((bound2-(6.0f32/4.0).sqrt()).abs()<1e-7);
+        assert!((bound3-(6.0f32/3.0).sqrt()).abs()<1e-7);
+        for (old,new,bound) in [(&a.l2w,&b.l2w,bound2),(&a.l3w,&b.l3w,bound3)] {
+            assert!(new.iter().all(|v|v.abs()<=bound));
+            assert!(new.iter().any(|v|v.abs()>0.01));
+            for (x,y) in old.iter().zip(new) { assert!((x/0.01-y/bound).abs()<1e-6); }
+        }
+        enabled.nnue_pytorch_init_scale=0.5; enabled.sfnn_init_l2_scale=Some(2.0); enabled.sfnn_init_l3_scale=Some(0.5);
+        let (b2,b3)=sfnn_l2_l3_weight_init_bounds(&enabled);
+        assert_eq!(b2,bound2); assert_eq!(b3,bound3*0.25);
     }
 
     #[test]

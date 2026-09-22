@@ -202,6 +202,14 @@ class GridSearchTests(unittest.TestCase):
         single = self.plan(["--grid", "sfnn-l2-l3-center", "true"])
         self.assertTrue(all(t["settings"]["sfnn_l2_l3_center"] is True for t in single["trials"]))
 
+    def test_glorot_and_centering_cartesian_grid(self):
+        plan=self.plan(["--grid","sfnn-init-l2-l3-glorot","false","true",
+                        "--grid","sfnn-l2-l3-center","false","true"])
+        fields,rows=grid.summarize(self.output,plan)
+        self.assertEqual(fields.count("sfnn_init_l2_l3_glorot"),1)
+        self.assertEqual({(r["sfnn_init_l2_l3_glorot"],r["sfnn_l2_l3_center"]) for r in rows},
+                         {(False,False),(False,True),(True,False),(True,True)})
+
     def complete_plan(self, plan):
         for trial in plan["trials"]:
             directory = grid.trial_dir(self.output, trial)
