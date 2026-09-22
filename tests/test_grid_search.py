@@ -34,6 +34,9 @@ class GridSearchTests(unittest.TestCase):
             self.assertNotIn("\x1b", (Path(tmp) / "stdout.log").read_text(encoding="utf-8"))
 
     def test_warmup_sb_grid(self):
+        grid.check_settings({**self.common, "superbatches": 1, "max_epochs": 1, "warmup_sb": 1024})
+        with self.assertRaisesRegex(ValueError, "warmup_sb"):
+            grid.check_settings({**self.common, "superbatches": 1, "max_epochs": 2, "warmup_sb": 1024})
         plan = self.plan(["--grid", "warmup_sb", "0", "1"])
         self.assertEqual({t["settings"]["warmup_sb"] for t in plan["trials"]}, {0, 1})
         self.complete_plan(plan)

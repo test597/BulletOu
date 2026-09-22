@@ -2,6 +2,8 @@
 
 ## 学習開始時のLR warmup
 
+短期比較では、`max_epochs: 1`に限り`warmup_sb > superbatches`を指定できます。例えば`superbatches: 1, warmup_sb: 1024`はwarmupの最初の1sbだけ学習し、終了時LRは`lr/1024`です。warmupを1sbに短縮したり、次epochに繰り越したりはしません。
+
 JSONの `"warmup_sb": 1`（CLI: `--warmup-sb 1`）で、**1epoch目の最初の1sbだけ**、ほぼ0から指定の`lr`まで線形に増加させます。非負整数で、デフォルト`0`は無効です。
 
 - cuda-cppの通常学習とworkerの`step` / `geometric` / `cos`に対応。`plateau`とdirect-step smokeモードは未対応で、指定時はエラーです。

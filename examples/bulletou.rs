@@ -5335,8 +5335,8 @@ impl Args {
                 || self.superbatches.is_none() || self.max_epochs.is_none() {
                 return Err("--warmup-sb requires cuda-cpp production training with step/geometric/cos LR".into());
             }
-            if self.warmup_sb > self.superbatches.unwrap() {
-                return Err("--warmup-sb must not exceed --superbatches".into());
+            if self.warmup_sb > self.superbatches.unwrap() && self.max_epochs != Some(1) {
+                return Err("--warmup-sb may exceed --superbatches only with --max-epochs 1 (warmup-prefix experiment)".into());
             }
         }
         if self.sfnn_qat_l1 {
@@ -33710,6 +33710,8 @@ mod tests {
         args.validate_arch_flags().unwrap();
         args.warmup_sb = 17;
         assert!(args.validate_arch_flags().is_err());
+        args.max_epochs = Some(1);
+        args.validate_arch_flags().unwrap();
         args.warmup_sb = 1;
         args.lr_schedule = LrScheduleKind::Plateau;
         assert!(args.validate_arch_flags().is_err());
@@ -33746,6 +33748,9 @@ mod tests {
         }
         args.warmup_sb = 4;
         assert_eq!(rate(&args, 1, 31), args.lr);
+        args.warmup_sb = 1024;
+        assert_eq!(rate(&args, 1, 7), args.lr / 1024.0);
+        args.warmup_sb = 4;
         assert_eq!(rate(&args, 2, 0), args.lr);
         // Production resume uses chunk epoch/SB, not a restarted local step counter.
         args.warmup_sb = 2;

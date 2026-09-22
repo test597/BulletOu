@@ -2,6 +2,8 @@
 
 ## Initial LR warmup
 
+For short prefix experiments, `warmup_sb > superbatches` is allowed only with `max_epochs: 1`. For example, `superbatches: 1, warmup_sb: 1024` trains only the first SB of warmup, ending at `lr/1024`. It neither compresses warmup nor carries it into another epoch.
+
 Set `"warmup_sb": 1` in JSON or `--warmup-sb 1` on the CLI. During **only the first SB of epoch 1**, LR rises linearly from near zero to `lr`. This is a nonnegative integer, default `0` (disabled).
 
 - Supported for cuda-cpp production step/geometric/cos schedules, including workers. Plateau and direct-step smoke mode reject nonzero warmup.

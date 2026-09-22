@@ -204,8 +204,10 @@ def check_settings(settings: dict) -> None:
     for key in ("max_epochs", "superbatches"):
         positive_int(settings, key)
     warmup = settings.get("warmup_sb", 0)
-    if type(warmup) is not int or not 0 <= warmup <= settings["superbatches"]:
-        raise ValueError("warmup_sb must be an integer between 0 and superbatches")
+    if type(warmup) is not int or warmup < 0:
+        raise ValueError("warmup_sb must be a nonnegative integer")
+    if warmup > settings["superbatches"] and settings["max_epochs"] != 1:
+        raise ValueError("warmup_sb may exceed superbatches only with max_epochs=1 (warmup-prefix experiment)")
     if warmup and settings.get("lr_schedule", "step") == "plateau":
         raise ValueError("warmup_sb supports step/geometric/cos, not plateau")
     test_positions = settings.get("test_positions")
