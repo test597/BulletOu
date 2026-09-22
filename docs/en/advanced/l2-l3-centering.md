@@ -57,7 +57,7 @@ Both flags appear in `grid_summary.csv`. Remove checkpoint inputs such as `initi
 
 ## Centered update equations
 
-Compute each layer's batch-global input mean `c` on GPU (not a separate mean per bucket). Before updating, transform `beta = b + W*c` and `gW_center = gW - gb*c`. Run the optimizer in these coordinates, then restore `b = beta - W*c`. Lookahead slow weights/biases undergo the same coordinate conversion.
+Compute each layer's input mean `c` on GPU over all batches/positions in the optimizer update (not a separate mean per bucket). With `batches_per_update=4`, use all four batches, not just the final batch. Before updating, transform `beta = b + W*c` and `gW_center = gW - gb*c` using accumulated gradients. Run the optimizer in these coordinates, then restore `b = beta - W*c`. Lookahead slow weights/biases undergo the same coordinate conversion.
 
 Forward, validation and nn.bin still use `W*x+b`. This is not BatchNorm or variance normalization. Moments are updated using centered gradients, so this is a different optimization algorithm from ordinary Ranger. It adds no penalty to the reported task loss.
 
@@ -65,12 +65,12 @@ GPU mean scratch is allocated on activation and reused (about 10 KiB for 1024/7/
 
 ## Supported combinations and resume
 
-- cuda-cpp SFNN, `batches_per_update=1`, `sfnn_update_scope=all`.
+- cuda-cpp SFNN, `batches_per_update>=1`, `sfnn_update_scope=all`. Keep bpu identical across comparison conditions.
 - L1 factorizer none/shared. FT factorization and L1 QAT are supported.
-- Explicit `optimizer_weight_clip=0`; zero weight decay, Norm loss, saturation penalty and factorizer residual decay.
+- Weight clipping is disabled while centering is active. Unspecified or positive clipping produces a warning and training continues; explicit zero avoids the warning. The JSON file is not rewritten. Weight decay, Norm loss, saturation penalty and factorizer residual decay must be zero.
 - No bucket counts/count gates or axis/pair factors yet.
 - L2 input/output widths each <=256; `buckets * L2 width <=65536`.
-- Unsupported combinations fail explicitly; clipping is never silently disabled.
+- Other unsupported combinations still fail explicitly. Epochs with centering off use the configured clipping policy again. To isolate centering in an A/B test, explicitly set `optimizer_weight_clip=0` in the common settings.
 
 Checkpoint and nn.bin formats are unchanged; weights/biases are folded back before saving. You may switch the flag on resume, but optimizer moments are retained, not automatically reset. This changes training conditions and is not equivalent to an A/B comparison from scratch. Specify the desired flag in the resumed CLI/JSON.
 

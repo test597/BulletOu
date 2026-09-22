@@ -6009,6 +6009,8 @@ int launch_sfnn_inverse_index_l0_backward(
         n_features = SFNN_HALFKA2_BASE_INPUT_SIZE;
     }
 
+    // Training accumulates across mini-batches. Gradients are cleared at runner
+    // initialization / optimizer update, not at the first perspective of each batch.
     if (launch_sfnn_inverse_index_for_perspective(
             ctx,
             stm_indices,
@@ -6018,7 +6020,7 @@ int launch_sfnn_inverse_index_l0_backward(
             max_active,
             n_features,
             ft_size,
-            0) != 0 ||
+            1) != 0 ||
         launch_sfnn_inverse_index_for_perspective(
             ctx,
             nstm_indices,
@@ -6215,7 +6217,7 @@ int launch_sfnn_backward_kernels(
                 l3fb_gradients,
                 l3axw_gradients,
                 l3axb_gradients,
-                fuse_pairwise_l0 == 0 ? 1 : 0) != 0) {
+                1) != 0) {
             return -1;
         }
     }

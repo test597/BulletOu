@@ -1989,6 +1989,7 @@ pub fn sfnn_forward_device_with_factorizer_and_alpha(
         None,
         None,
         None,
+        false,
     )
 }
 
@@ -1999,7 +2000,7 @@ fn sfnn_forward_train_device_with_factorizer(
     workspace: &SfnnForwardWorkspace,
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
-    folded_l0w_scratch: &F32Buffer,
+    folded_l0w_scratch: Option<&F32Buffer>,
     residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
 ) -> Result<()> {
@@ -2010,10 +2011,17 @@ fn sfnn_forward_train_device_with_factorizer(
         workspace,
         factorizer,
         factorizer_alpha,
-        Some(folded_l0w_scratch),
+        folded_l0w_scratch,
         residual_count_gates,
         factorizer_axis_confidences,
-    )
+        true,
+    )?;
+    // Only single-batch updates may reuse the gradient buffer for folded weights.
+    // Backward now adds to FT gradients, so discard those temporary weights first.
+    if weights.shape.input_size == 133_578 {
+        if let Some(scratch) = folded_l0w_scratch { scratch.fill(ctx, 0.0)?; }
+    }
+    Ok(())
 }
 
 fn sfnn_forward_device_with_factorizer_impl(
@@ -2026,6 +2034,7 @@ fn sfnn_forward_device_with_factorizer_impl(
     folded_l0w_scratch: Option<&F32Buffer>,
     residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
+    training: bool,
 ) -> Result<()> {
     batch.validate()?;
     weights.validate()?;
@@ -2099,7 +2108,7 @@ fn sfnn_forward_device_with_factorizer_impl(
         _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
     };
     // Validation keeps its FP32 semantics, even when called on a training runner.
-    let qat = workspace.qat_l1.as_ref().filter(|_| folded_l0w_scratch.is_some());
+    let qat = workspace.qat_l1.as_ref().filter(|_| training);
     workspace.qat_l1_active.set(false);
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
     check(unsafe {
@@ -3537,6 +3546,7 @@ pub fn sfnn_backward_train_profile_device_with_factorizer_and_alpha(
         factorizer_alpha,
         None,
         None,
+        true,
     )
 }
 
@@ -3552,6 +3562,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
     factorizer_alpha: SfnnFactorizerAlpha,
     residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
+    zero_parameter_gradients: bool,
 ) -> Result<SfnnBackwardStageProfile> {
     batch.validate()?;
     weights.validate()?;
@@ -3718,7 +3729,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
             backward.l3fb_gradients.as_ptr(),
             backward.l3axw_gradients.as_ptr(),
             backward.l3axb_gradients.as_ptr(),
-            1,
+            i32::from(zero_parameter_gradients),
             profile_ms.as_mut_ptr(),
             profile_ms.len(),
         )
@@ -6092,6 +6103,9 @@ impl SfnnTrainStepUploadSlot {
 #[derive(Debug)]
 pub struct SfnnTrainStepRunner {
     experimental_output_centers: Option<(F32Buffer, F32Buffer)>,
+    output_center_sums: Option<(F32Buffer, F32Buffer)>,
+    output_center_batches: usize,
+    pending_gradient_batches: usize,
     pub shape: SfnnForwardShape,
     pub batch_size: usize,
     pub max_active: usize,
@@ -6174,7 +6188,7 @@ impl SfnnUpdateScope {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SfnnLayerLrMultipliers {
-    /// Batch-input-centered optimizer coordinates for L2/L3 (bpu=1 only).
+    /// Input-centered optimizer coordinates for L2/L3 over all accumulated batches.
     pub l2_l3_center: bool,
     pub norm_loss_strength: f32,
     pub l0: f32,
@@ -6421,6 +6435,9 @@ impl SfnnTrainStepRunner {
             optimizer_states,
             factorizer,
             factorizer_alpha,
+            output_center_sums: None,
+            output_center_batches: 0,
+            pending_gradient_batches: 0,
             experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu") {
                 Some((F32Buffer::new(ctx, 32 * shape.l2_in())?, F32Buffer::new(ctx, 32 * shape.l2_size)?))
             } else { None },
@@ -6976,11 +6993,14 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
+        self.output_center_batches = 0;
+        self.pending_gradient_batches = 0;
         self.forward_workspace.invalidate_l1_qat();
         src.factorizer.validate_for_shape(self.shape)?;
         src.factorizer_alpha.validate()?;
         self.weights.copy_from_device(ctx, &src.weights)?;
         self.optimizer_states.copy_from_device(ctx, self.shape, &src.optimizer_states)?;
+        self.backward_workspace.zero_parameter_gradients(ctx)?;
         self.factorizer = src.factorizer;
         self.factorizer_alpha = src.factorizer_alpha;
         Ok(())
@@ -6994,6 +7014,8 @@ impl SfnnTrainStepRunner {
         factorizer: SfnnFactorizerActive,
         factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<()> {
+        self.output_center_batches = 0;
+        self.pending_gradient_batches = 0;
         self.forward_workspace.invalidate_l1_qat();
         weights.validate()?;
         if self.shape != weights.shape {
@@ -7138,7 +7160,7 @@ impl SfnnTrainStepRunner {
             &self.forward_workspace,
             self.factorizer,
             self.factorizer_alpha,
-            &self.backward_workspace.l0w_gradients,
+            (update_weights && self.pending_gradient_batches == 0).then_some(&self.backward_workspace.l0w_gradients),
             self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
@@ -7167,6 +7189,8 @@ impl SfnnTrainStepRunner {
             self.factorizer_axis_confidences(),
             &self.entry_weights,
         )?;
+        experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
+        self.pending_gradient_batches += 1;
         if update_weights {
             self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
         }
@@ -7308,7 +7332,7 @@ impl SfnnTrainStepRunner {
                 &self.forward_workspace,
                 self.factorizer,
                 self.factorizer_alpha,
-                &self.backward_workspace.l0w_gradients,
+                (update_weights && self.pending_gradient_batches == 0).then_some(&self.backward_workspace.l0w_gradients),
                 self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
             )?;
@@ -7338,6 +7362,8 @@ impl SfnnTrainStepRunner {
                 &slot.entry_weights,
             )?;
         }
+        experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
+        self.pending_gradient_batches += 1;
         if update_weights {
             self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
         }
@@ -7441,7 +7467,7 @@ impl SfnnTrainStepRunner {
             &self.forward_workspace,
             self.factorizer,
             self.factorizer_alpha,
-            &self.backward_workspace.l0w_gradients,
+            (update_weights && self.pending_gradient_batches == 0).then_some(&self.backward_workspace.l0w_gradients),
             self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
@@ -7468,8 +7494,11 @@ impl SfnnTrainStepRunner {
             self.factorizer_alpha,
             self.residual_count_gates(),
             self.factorizer_axis_confidences(),
+            false,
         )?;
         after_backward.record(ctx)?;
+        experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
+        self.pending_gradient_batches += 1;
         if update_weights {
             self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
         }
@@ -7510,6 +7539,7 @@ impl SfnnTrainStepRunner {
             None,
             self.residual_count_gates(),
             self.factorizer_axis_confidences(),
+            false,
         )
     }
 
@@ -8279,6 +8309,8 @@ impl SfnnTrainStepRunner {
         if let Some(c) = &experiment_output_center {
             experimental_output_center::transform(self, ctx, c, false)?;
         }
+        self.output_center_batches = 0;
+        self.pending_gradient_batches = 0;
         Ok(())
     }
 }
@@ -10028,7 +10060,7 @@ mod tests {
                 &forward,
                 active,
                 a,
-                &backward.l0w_gradients,
+                Some(&backward.l0w_gradients),
                 None,
                 None,
             )

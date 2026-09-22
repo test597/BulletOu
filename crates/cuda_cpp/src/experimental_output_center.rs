@@ -1,8 +1,26 @@
-//! Opt-in bpu=1 optimizer coordinates of L2/L3; GPU production option and host reference.
+//! Opt-in optimizer coordinates of L2/L3; GPU production option and host reference.
 //! Forward/checkpoints retain the folded affine form. Not native Ranger.
 use super::*;
 
 pub(super) struct Centers { l2: Vec<f32>, l3: Vec<f32>, device: bool }
+pub(super) fn accumulate(r:&mut SfnnTrainStepRunner,ctx:&Context,enabled:bool)->Result<()> {
+    if !enabled { r.output_center_batches=0; return Ok(()); }
+    if r.experimental_output_centers.is_none() {
+        r.experimental_output_centers=Some((F32Buffer::new(ctx,32*r.shape.l2_in())?,F32Buffer::new(ctx,32*r.shape.l2_size)?));
+    }
+    if r.output_center_sums.is_none() {
+        r.output_center_sums=Some((F32Buffer::new(ctx,r.shape.l2_in())?,F32Buffer::new(ctx,r.shape.l2_size)?));
+    }
+    let (c2,c3)=r.experimental_output_centers.as_ref().unwrap();
+    let (sum2,sum3)=r.output_center_sums.as_ref().unwrap();
+    if r.output_center_batches==0 {sum2.fill(ctx,0.0)?;sum3.fill(ctx,0.0)?;}
+    mean_into(ctx,&r.forward_workspace.l2_input,r.batch_size,r.shape.l2_in(),c2)?;
+    mean_into(ctx,&r.forward_workspace.l2,r.batch_size,r.shape.l2_size,c3)?;
+    axpy_device(ctx,r.shape.l2_in(),1.0,c2,sum2,sum2)?;
+    axpy_device(ctx,r.shape.l2_size,1.0,c3,sum3,sum3)?;
+    r.output_center_batches+=1;
+    Ok(())
+}
 fn mean_into(ctx:&Context,x:&F32Buffer,n:usize,d:usize,scratch:&F32Buffer)->Result<()> {
     check(unsafe {ffi::bulletou_experiment_column_mean(ctx.as_ptr(),x.as_ptr(),scratch.as_ptr(),n,d)})
 }
@@ -22,8 +40,8 @@ pub(super) fn capture(r:&SfnnTrainStepRunner,ctx:&Context,p:RangerUpdateParams,l
         Ok(s) if s=="gpu"=>true,
         _=>return Err(CudaCppError::message("output centering expects 1 (host reference) or gpu")),
     }};
-    if p.radam.gradient_factor != 1.0 || lr.update_scope != SfnnUpdateScope::All {
-        return Err(CudaCppError::message("L2/L3 centering requires batches-per-update=1 and update-scope=all"));
+    if lr.update_scope != SfnnUpdateScope::All {
+        return Err(CudaCppError::message("L2/L3 centering requires update-scope=all"));
     }
     if r.shape.l2_in() > 256 || r.shape.l2_size > 256 || r.weights.l2b.len() > 65536 {
         return Err(CudaCppError::message("L2/L3 centering supports L2 input/output widths <=256 and stacks*L2 <=65536"));
@@ -37,11 +55,18 @@ pub(super) fn capture(r:&SfnnTrainStepRunner,ctx:&Context,p:RangerUpdateParams,l
         return Err(CudaCppError::message("L2/L3 centering requires none/shared, no gates/clip/penalties/other centering"));
     }
     static ANNOUNCE:std::sync::Once=std::sync::Once::new();
-    ANNOUNCE.call_once(||eprintln!("  EXPERIMENT output centering: L2/L3 batch-global input means; FT/L1 untouched; folded bias fast/slow coordinates; bpu=1 diagnostic; implementation={}",if gpu {"gpu"}else{"host reference"}));
+    ANNOUNCE.call_once(||eprintln!("  L2/L3 centering: input means over accumulated batches; FT/L1 untouched; folded bias fast/slow coordinates; implementation={}",if gpu {"gpu"}else{"host reference"}));
     if gpu {
         let (c2,c3)=r.experimental_output_centers.as_ref().ok_or_else(||CudaCppError::message("configure GPU output centering before constructing the runner"))?;
-        mean_into(ctx,&r.forward_workspace.l2_input,r.batch_size,r.shape.l2_in(),c2)?;
-        mean_into(ctx,&r.forward_workspace.l2,r.batch_size,r.shape.l2_size,c3)?;
+        if lr.l2_l3_center && r.output_center_batches>0 {
+            let (sum2,sum3)=r.output_center_sums.as_ref().unwrap();
+            c2.fill(ctx,0.0)?; c3.fill(ctx,0.0)?;
+            axpy_device(ctx,r.shape.l2_in(),1.0/r.output_center_batches as f32,sum2,c2,c2)?;
+            axpy_device(ctx,r.shape.l2_size,1.0/r.output_center_batches as f32,sum3,c3,c3)?;
+        } else {
+            mean_into(ctx,&r.forward_workspace.l2_input,r.batch_size,r.shape.l2_in(),c2)?;
+            mean_into(ctx,&r.forward_workspace.l2,r.batch_size,r.shape.l2_size,c3)?;
+        }
         return Ok(Some(Centers{l2:vec![],l3:vec![],device:true}));
     }
     Ok(Some(Centers{l2:mean(ctx,&r.forward_workspace.l2_input,r.batch_size,r.shape.l2_in())?,
@@ -68,6 +93,81 @@ pub(super) fn transform(r:&SfnnTrainStepRunner,ctx:&Context,c:&Centers,before:bo
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn accumulated_centering_matches_one_large_batch() {
+        let ctx=Context::new(0).unwrap(); let upload=Context::new(0).unwrap();
+        for input_size in [4,133_578] { for centered in [false,true] {
+        let s=SfnnForwardShape{input_size,..crate::tests::tiny_sfnn_shape()};
+        let mut weights=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        weights.shape=s;
+        let ft_weights:Vec<f32>=(0..input_size*s.ft_size).map(|i|0.05+0.03*(i%9) as f32).collect();
+        weights.l0w=&ft_weights;
+        weights.l2fw=None; weights.l2fb=None; weights.l3fw=None; weights.l3fb=None;
+        let policy=SfnnLayerLrMultipliers{l2_l3_center:centered,..Default::default()};
+        for bpu in [1,2,4] { for mode in [0,1,2] {
+            let n=4*bpu;
+            let mut small=SfnnTrainStepRunner::new(&ctx,weights,4,1).unwrap();
+            let mut large=SfnnTrainStepRunner::new(&ctx,weights,n,1).unwrap();
+            let stm:Vec<i32>=(0..n).map(|i|((i+i/4)%4) as i32).collect();
+            let nstm:Vec<i32>=(0..n).map(|i|((i*3+1)%4) as i32).collect();
+            let buckets:Vec<i32>=(0..n).map(|i|(i%2) as i32).collect();
+            let targets:Vec<f32>=(0..n).map(|i|0.1+0.1*(i%8) as f32).collect();
+            let entries=vec![1.0;n];
+            let batch=|start:usize,end:usize| SfnnTrainStepHostBatch {
+                stm_indices:&stm[start..end],nstm_indices:&nstm[start..end],buckets:&buckets[start..end],
+                targets:&targets[start..end],entry_weights:&entries[start..end],batch_size:end-start,max_active:1 };
+            for step in 1..=12 {
+                let mut p=RangerUpdateParams::default();p.radam.step=step;
+                large.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,p,ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(0,n),true,true,policy).unwrap();
+                p.radam.gradient_factor=1.0/bpu as f32;
+                for j in 0..bpu {
+                    if mode==2 {
+                        small.step_profiled_no_readback_with_update_and_lr_multipliers(&ctx,p,ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(j*4,j*4+4),j+1==bpu,policy).unwrap();
+                    } else if mode==1 {
+                        small.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,&upload,p,ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(j*4,j*4+4),true,j+1==bpu,policy).unwrap();
+                    } else {
+                        small.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,p,ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(j*4,j*4+4),true,j+1==bpu,policy).unwrap();
+                    }
+                    assert_eq!(small.output_center_batches,if j+1==bpu || !centered {0}else{j+1});
+                }
+                for (tensor,(a,b)) in [(&small.weights.l0w,&large.weights.l0w),(&small.weights.l1w,&large.weights.l1w),
+                    (&small.weights.l2w,&large.weights.l2w),(&small.weights.l2b,&large.weights.l2b),
+                    (&small.weights.l3w,&large.weights.l3w),(&small.weights.l3b,&large.weights.l3b),
+                    (&small.optimizer_states.l2w.momentum,&large.optimizer_states.l2w.momentum),
+                    (&small.optimizer_states.l3b.slow_params,&large.optimizer_states.l3b.slow_params)].into_iter().enumerate() {
+                    for (a,b) in a.download(&ctx).unwrap().iter().zip(b.download(&ctx).unwrap()) {
+                        assert!((a-b).abs()<2e-5,"input={input_size},center={centered},tensor={tensor},bpu={bpu},mode={mode},step={step}: {a} != {b}");
+                    }
+                }
+            }
+        }}}}
+    }
+    #[test] fn accumulated_means_reset_on_update_and_restore() {
+        let ctx=Context::new(0).unwrap(); let s=crate::tests::tiny_sfnn_shape();
+        let mut weights=crate::tests::tiny_sfnn_weights(s);
+        weights.l2fw=None; weights.l2fb=None; weights.l3fw=None; weights.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,weights,4,1).unwrap();
+        let snapshot=r.snapshot_device(&ctx).unwrap();
+        let policy=SfnnLayerLrMultipliers{l2_l3_center:true,..Default::default()};
+        for c in [0.1,0.3,0.5,0.7] {
+            r.forward_workspace.l2_input.fill(&ctx,c).unwrap();
+            r.forward_workspace.l2.fill(&ctx,c*0.5).unwrap();
+            accumulate(&mut r,&ctx,true).unwrap();
+        }
+        capture(&r,&ctx,Default::default(),policy).unwrap();
+        let (c2,c3)=r.experimental_output_centers.as_ref().unwrap();
+        assert!((c2.download(&ctx).unwrap()[0]-0.4).abs()<1e-6);
+        assert!((c3.download(&ctx).unwrap()[0]-0.2).abs()<1e-6);
+        r.backward_workspace.l0w_gradients.fill(&ctx,1.0).unwrap();
+        r.copy_state_from_device(&ctx,&snapshot).unwrap();
+        assert_eq!(r.output_center_batches,0);
+        assert!(r.backward_workspace.l0w_gradients.download(&ctx).unwrap().iter().all(|&v|v==0.0));
+        r.forward_workspace.l2_input.fill(&ctx,0.9).unwrap();
+        accumulate(&mut r,&ctx,true).unwrap();
+        capture(&r,&ctx,Default::default(),policy).unwrap();
+        assert!((r.experimental_output_centers.as_ref().unwrap().0.download(&ctx).unwrap()[0]-0.9).abs()<1e-6);
+        r.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,Default::default(),policy,None).unwrap();
+        assert_eq!(r.output_center_batches,0);
+    }
     #[test] fn option_update_matches_explicit_centering_and_reuses_buffers() {
         let ctx=Context::new(0).unwrap(); let s=crate::tests::tiny_sfnn_shape();
         let mut weights=crate::tests::tiny_sfnn_weights(s);
@@ -107,7 +207,7 @@ pub(super) fn transform(r:&SfnnTrainStepRunner,ctx:&Context,c:&Centers,before:bo
         assert!(capture(&r,&ctx,p,Default::default()).unwrap().is_none());
         assert!(capture(&r,&ctx,p,SfnnLayerLrMultipliers{tatara_weight_clip:true,..policy}).is_err());
         let mut p=p; p.radam.gradient_factor=0.25;
-        assert!(capture(&r,&ctx,p,policy).is_err());
+        assert!(capture(&r,&ctx,p,policy).is_ok());
     }
     #[test] fn gpu_and_host_centering_match_ranger_fast_slow_and_moments() {
         let ctx=Context::new(0).unwrap();

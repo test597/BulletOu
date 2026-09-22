@@ -87,7 +87,7 @@ mod tests {
         r.device_batch.nstm_indices.upload(&ctx,&[3,2,1,0]).unwrap();
         r.device_batch.buckets.upload(&ctx,&[0,1,0,1]).unwrap();
         let forward=||sfnn_forward_train_device_with_factorizer(&ctx,&r.device_batch,&r.weights,&r.forward_workspace,
-            r.factorizer,r.factorizer_alpha,&r.backward_workspace.l0w_gradients,None,None).unwrap();
+            r.factorizer,r.factorizer_alpha,None,None,None).unwrap();
         forward();let x=r.forward_workspace.combined.download(&ctx).unwrap();
         let old=r.forward_workspace.l1.download(&ctx).unwrap();
         let c=[0.1,0.2,0.3,0.4];let lr=0.03;let rows=shape.l1_out();let cols=shape.ft_size;

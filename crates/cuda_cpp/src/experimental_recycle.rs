@@ -122,7 +122,7 @@ fn recycle_now(r: &SfnnTrainStepRunner, ctx: &Context, batch: &SfnnForwardDevice
     replace_group(ctx,&r.weights.l2b,&r.optimizer_states.l2b,&b2,&cb2)?;
     if let Some(qat)=&r.forward_workspace.qat_l1 { qat.refresh.set(true); }
     sfnn_forward_train_device_with_factorizer(ctx,batch,&r.weights,&r.forward_workspace,
-        r.factorizer,r.factorizer_alpha,&r.backward_workspace.l0w_gradients,
+        r.factorizer,r.factorizer_alpha,None,
         r.residual_count_gates(),r.factorizer_axis_confidences())?;
     let new_output=r.forward_workspace.output.download(ctx)?;
     let (mut max,mut sq,mut mass)=(0.0f64,0.0f64,0.0f64);
@@ -151,7 +151,7 @@ fn recycle_now(r: &SfnnTrainStepRunner, ctx: &Context, batch: &SfnnForwardDevice
         r.prepare_l1_qat(&ctx,true).unwrap();
         let shared=r.weights.l1fw.as_ref().unwrap().download(&ctx).unwrap();
         sfnn_forward_train_device_with_factorizer(&ctx,&r.device_batch,&r.weights,&r.forward_workspace,
-            r.factorizer,r.factorizer_alpha,&r.backward_workspace.l0w_gradients,None,None).unwrap();
+            r.factorizer,r.factorizer_alpha,None,None,None).unwrap();
         let before=r.forward_workspace.output.download(&ctx).unwrap();
         r.optimizer_states.l1w.momentum.fill(&ctx,0.25).unwrap();
         recycle_now(&r,&ctx,&r.device_batch,&r.entry_weights,9761,true).unwrap();

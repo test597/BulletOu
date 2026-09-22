@@ -57,7 +57,7 @@ python .\grid_search.py `
 
 ## 中心化の計算
 
-各batchで、L2とL3それぞれの入力平均ベクトル `c` をGPU上で計算します。bucket別平均ではなく、batch全体の平均です。更新直前に `beta = b + W*c`、`gW_center = gW - gb*c` とし、この座標で既存のoptimizer更新を行います。更新後に `b = beta - W*c` に戻します。Lookaheadのslow weight/biasも同様に変換します。
+L2とL3それぞれの入力平均ベクトル `c` をGPU上で計算します。bucket別平均ではなく、optimizer更新に使う全batch・全局面の平均です。`batches_per_update=4` なら4batch分の平均と累積勾配を使い、最後のbatchだけでは計算しません。更新直前に `beta = b + W*c`、`gW_center = gW - gb*c` とし、この座標で既存のoptimizer更新を行います。更新後に `b = beta - W*c` に戻します。Lookaheadのslow weight/biasも同様に変換します。
 
 forward・validation・nn.binは従来どおり `W*x+b` です。BatchNormや入力の分散正規化ではありません。中心化した勾配に対してmomentum等を更新するため、通常のRangerと同じ学習アルゴリズムではありません。報告されるlossに追加の罰則は加えません。
 
@@ -65,12 +65,12 @@ forward・validation・nn.binは従来どおり `W*x+b` です。BatchNormや入
 
 ## 現在の対応範囲と再開
 
-- cuda-cppのSFNN、`batches_per_update=1`、`sfnn_update_scope=all`。
+- cuda-cppのSFNN、`batches_per_update>=1`、`sfnn_update_scope=all`。bpuは比較対象と同じ値を使用できます。
 - L1 factorizerはnone/shared。FT factorizerとL1 QATは使用可能。
-- weight clipは明示的に0。weight decay・Norm loss・saturation penalty・factorizer residual decayは0。
+- weight clipは中心化中は無効。省略または正の値なら警告を出して無効化し、学習を続行します。明示的に0なら警告は出しません。JSON自体は書き換えません。weight decay・Norm loss・saturation penalty・factorizer residual decayは0。
 - bucket counts/count gates、axis/pair factorizerとの併用は現在非対応。
 - L2入力幅・出力幅は各256以下、`bucket数 × L2幅` は65536以下。
-- 非対応の組み合わせはエラーにします。clip等を暗黙に無効化しません。
+- clip以外の非対応の組み合わせは引き続きエラーにします。中心化OFFのepochでは設定されたclip動作に戻ります。中心化だけを比較したい場合は、共通設定で `optimizer_weight_clip=0` としてください。
 
 checkpointとnn.binの形式は変更しません。checkpoint保存時には通常のweight/bias表現に戻っています。ON/OFFを変えて再開できますが、optimizerのmomentum等は引き継ぎ、自動リセットしません。これは学習条件変更なので、新規学習でのA/B比較と同じではありません。再開時もJSONまたはCLIでON/OFFを明示してください。
 

@@ -5175,7 +5175,8 @@ struct Args {
     sfnn_norm_loss_strength: f32,
 
     /// Center L2/L3 optimizer coordinates on GPU; inference format is unchanged.
-    /// Requires cuda-cpp, bpu=1, none/shared factorizer, no clipping/decay/penalties/count gates.
+    /// Requires cuda-cpp, none/shared factorizer, no decay/penalties/count gates.
+    /// Weight clipping is disabled with a warning; supports gradient accumulation.
     #[arg(long)]
     sfnn_l2_l3_center: bool,
 
@@ -5308,13 +5309,17 @@ impl Args {
             if self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack() {
                 return Err("--sfnn-l2-l3-center requires --backend cuda-cpp and an SFNN arch".into());
             }
-            if self.batches_per_update != 1 || self.sfnn_update_scope != SfnnUpdateScopeArg::All {
-                return Err("--sfnn-l2-l3-center requires --batches-per-update 1 and --sfnn-update-scope all".into());
+            if self.sfnn_update_scope != SfnnUpdateScopeArg::All {
+                return Err("--sfnn-l2-l3-center requires --sfnn-update-scope all".into());
             }
-            if self.optimizer_weight_clip != Some(0.0) || self.optimizer_weight_decay != 0.0
+            if self.optimizer_weight_clip != Some(0.0) {
+                static WARNING: std::sync::Once = std::sync::Once::new();
+                WARNING.call_once(|| eprintln!("  WARN: --sfnn-l2-l3-center disables optimizer weight clipping; configured/default bounds are ignored while centering is enabled (effective optimizer_weight_clip=0)."));
+            }
+            if self.optimizer_weight_decay != 0.0
                 || self.sfnn_norm_loss_strength != 0.0 || self.sfnn_saturation_penalty != 0.0
                 || self.sfnn_factorizer_residual_decay != 0.0 {
-                return Err("--sfnn-l2-l3-center requires --optimizer-weight-clip 0, --optimizer-weight-decay 0, --sfnn-norm-loss-strength 0, --sfnn-saturation-penalty 0 and --sfnn-factorizer-residual-decay 0".into());
+                return Err("--sfnn-l2-l3-center requires --optimizer-weight-decay 0, --sfnn-norm-loss-strength 0, --sfnn-saturation-penalty 0 and --sfnn-factorizer-residual-decay 0".into());
             }
             let spec = effective_sfnn_factorizer_spec(self);
             if spec != SfnnFactorizerSpec::NONE && spec != SfnnFactorizerSpec::SHARED {
@@ -5976,7 +5981,7 @@ fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
         eprintln!(
             "  optimizer weight clip        = tatara: L1/L2 weights+biases, L3 weights +/-1.984375; FT and L3 bias off (individual tensors, after RAdam)"
         );
-    } else if args.optimizer_weight_clip.unwrap_or(0.0) == 0.0 {
+    } else if args.sfnn_l2_l3_center || args.optimizer_weight_clip.unwrap_or(0.0) == 0.0 {
         eprintln!("  optimizer weight clip        = off");
     } else {
         eprintln!(
@@ -6081,7 +6086,7 @@ fn quantized_loss_label(args: &QuantizedTestArgs) -> String {
 const STATE_BACKEND_CUDA_CPP: &str = "cuda-cpp";
 
 fn uses_tatara_weight_clip(args: &Args) -> bool {
-    args.optimizer_weight_clip.is_none()
+    !args.sfnn_l2_l3_center && args.optimizer_weight_clip.is_none()
         && matches!(
             args.resolved_eval_type(),
             Some(EvalType::SfnnKa2 | EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2)
@@ -6089,6 +6094,7 @@ fn uses_tatara_weight_clip(args: &Args) -> bool {
 }
 
 fn optimizer_weight_clip_signature(args: &Args) -> String {
+    if args.sfnn_l2_l3_center { return "0.000000000".into(); }
     if uses_tatara_weight_clip(args) {
         "tatara".to_string()
     } else {
@@ -6099,7 +6105,9 @@ fn optimizer_weight_clip_signature(args: &Args) -> String {
 fn ranger_params(args: &Args) -> optimiser::RangerParams {
     // The CUDA backend recognizes the full finite range as clipping disabled.
     // SFNN's default per-layer bounds are applied when dispatching each tensor.
-    let clip = args.optimizer_weight_clip.filter(|clip| *clip > 0.0).unwrap_or(f32::MAX);
+    let clip = if args.sfnn_l2_l3_center { f32::MAX } else {
+        args.optimizer_weight_clip.filter(|clip| *clip > 0.0).unwrap_or(f32::MAX)
+    };
     let mut params = optimiser::RangerParams {
         decay: args.optimizer_weight_decay,
         min_weight: -clip,
@@ -24564,7 +24572,7 @@ fn cuda_cpp_should_profile_sfnn_diagnostics(args: &Args, progress: Option<CudaCp
 #[cfg(feature = "cuda-cpp-backend")]
 fn print_sfnn_qat_mode(args: &Args) {
     print_startup_kv("L2/L3 centering", if args.sfnn_l2_l3_center {
-        "on: GPU batch-input means, centered optimizer coordinates; folded forward/export; bpu=1"
+        "on: GPU accumulated-batch input means, centered optimizer coordinates; folded forward/export; weight clipping disabled"
     } else { "off" });
     print_startup_kv(
         "L1 QAT",
@@ -33976,9 +33984,14 @@ mod tests {
         assert!(cuda_cpp_sfnn_layer_lr_multipliers(&enabled,None).l2_l3_center);
         assert!(resume_signature_matches(&old,&enabled));
         let mut invalid=enabled.clone(); invalid.batches_per_update=4;
-        assert!(invalid.validate_arch_flags().unwrap_err().contains("batches-per-update"));
+        assert!(invalid.validate_arch_flags().is_ok());
         invalid=enabled.clone(); invalid.optimizer_weight_clip=None;
-        assert!(invalid.validate_arch_flags().unwrap_err().contains("weight-clip"));
+        assert!(invalid.validate_arch_flags().is_ok());
+        assert!(!uses_tatara_weight_clip(&invalid));
+        assert_eq!(optimizer_weight_clip_signature(&invalid),"0.000000000");
+        invalid.optimizer_weight_clip=Some(0.25);
+        assert!(invalid.validate_arch_flags().is_ok());
+        assert_eq!(ranger_params(&invalid).max_weight,f32::MAX);
         invalid=enabled.clone(); invalid.sfnn_norm_loss_strength=0.001;
         assert!(invalid.validate_arch_flags().is_err());
         let mut scheduled=base.clone();
