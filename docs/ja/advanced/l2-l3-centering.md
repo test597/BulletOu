@@ -101,6 +101,8 @@ python .\grid_search.py `
 
 ## 中心化の計算
 
+FTの継続飽和には別途[FT線形penalty](ft-saturation-penalty.md)をA/B実験できます。これは中心化と併用可能な、デフォルトOFFのactivation penaltyです。
+
 L2とL3それぞれの入力平均ベクトル `c` をGPU上で計算します。bucket別平均ではなく、optimizer更新に使う全batch・全局面の平均です。`batches_per_update=4` なら4batch分の平均と累積勾配を使い、最後のbatchだけでは計算しません。更新直前に `beta = b + W*c`、`gW_center = gW - gb*c` とし、この座標で既存のoptimizer更新を行います。更新後に `b = beta - W*c` に戻します。Lookaheadのslow weight/biasも同様に変換します。
 
 forward・validation・nn.binは従来どおり `W*x+b` です。BatchNormや入力の分散正規化ではありません。中心化した勾配に対してmomentum等を更新するため、通常のRangerと同じ学習アルゴリズムではありません。報告されるlossに追加の罰則は加えません。

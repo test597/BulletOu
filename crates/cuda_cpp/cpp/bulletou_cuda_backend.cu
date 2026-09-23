@@ -11076,6 +11076,99 @@ extern "C" int bulletou_cuda_cpp_rebase_shared_device(
     return check_kernel_launch("shared rebase scale");
 }
 
+// Counts use unweighted eligible positions; both perspectives belong to the same FT unit.
+__global__ void ft_guard_count(const float* a,const float* b,const float* weights,
+    int* counts,size_t batch,size_t ft) {
+    __shared__ int hits[256];
+    __shared__ int eligible[8];
+    const unsigned x=threadIdx.x,y=threadIdx.y;
+    const size_t u=blockIdx.x*32+x;
+    int h=0,n=0;
+    for(size_t i=blockIdx.y*8+y;i<batch;i+=gridDim.y*8) {
+        if(weights[i]>0.0f) {
+            n+=2;
+            if(u<ft) h+=(a[i*ft+u]>=1.0f)+(b[i*ft+u]>=1.0f);
+        }
+    }
+    hits[y*32+x]=h;
+    if(x==0) eligible[y]=n;
+    __syncthreads();
+    if(y==0 && u<ft) {
+        int sum=0;
+        for(unsigned j=0;j<8;++j) sum+=hits[j*32+x];
+        atomicAdd(counts+u,sum);
+    }
+    if(blockIdx.x==0 && x==0 && y==0) {
+        int sum=0;
+        for(unsigned j=0;j<8;++j) sum+=eligible[j];
+        atomicAdd(counts+ft,sum);
+    }
+}
+
+__global__ void ft_guard_streak(const int* counts,int* streaks,size_t ft,float rate,int patience) {
+    const size_t u=blockIdx.x*blockDim.x+threadIdx.x;
+    if(u>=ft) return;
+    if(counts[ft]>0 && double(counts[u])>=double(rate)*counts[ft])
+        streaks[u]=streaks[u]<patience?streaks[u]+1:patience;
+    else streaks[u]=0;
+}
+
+__global__ void ft_guard_gradient(const float* a,const float* b,const float* weights,
+    const int* ai,const int* bi,const int* streaks,float* gw,float* gb,
+    size_t batch,size_t ft,size_t active,size_t inputs,float ft_alpha,float strength,int patience) {
+    const size_t u=blockIdx.y;
+    if(streaks[u]<patience) return;
+    const size_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    float g=0.0f;
+    if(i<batch && weights[i]>0.0f) {
+        const float delta=strength*weights[i]/(2.0f*float(batch)*float(ft));
+        for(int view=0;view<2;++view) {
+            if((view?b:a)[i*ft+u]<1.0f) continue;
+            g+=delta;
+            const int* indices=(view?bi:ai)+i*active;
+            for(size_t j=0;j<active;++j) {
+                const int feature=indices[j];
+                if(feature>=0 && size_t(feature)<inputs)
+                    sfnn_atomic_add_l0w_gradient(gw,size_t(feature),inputs,ft,u,delta,ft_alpha);
+            }
+        }
+    }
+    __shared__ float sums[256];
+    sums[threadIdx.x]=g;
+    __syncthreads();
+    for(unsigned s=128;s;s>>=1) {
+        if(threadIdx.x<s) sums[threadIdx.x]+=sums[threadIdx.x+s];
+        __syncthreads();
+    }
+    if(threadIdx.x==0 && sums[0]!=0.0f) atomicAdd(gb+u,sums[0]);
+}
+
+extern "C" int bulletou_ft_saturation_guard(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* a,BulletOuCudaCppF32Buffer* b,BulletOuCudaCppF32Buffer* weights,
+    BulletOuCudaCppI32Buffer* ai,BulletOuCudaCppI32Buffer* bi,
+    BulletOuCudaCppI32Buffer* counts,BulletOuCudaCppI32Buffer* streaks,
+    BulletOuCudaCppF32Buffer* gw,BulletOuCudaCppF32Buffer* gb,
+    size_t batch,size_t ft,size_t active,size_t inputs,float ft_alpha,float strength,float rate,int patience) {
+    if(!ctx || !batch || batch>INT_MAX/2 || !ft || ft>65535 || !active || !inputs || patience<1
+        || !std::isfinite(strength) || strength<0 || !std::isfinite(rate) || rate<=0 || rate>1
+        || !std::isfinite(ft_alpha) || batch>SIZE_MAX/ft || batch>SIZE_MAX/active || inputs>SIZE_MAX/ft)
+        return fail_message("invalid FT saturation guard parameters");
+    if(validate_buffer(ctx,a,batch*ft,"FT stm") || validate_buffer(ctx,b,batch*ft,"FT nstm")
+        || validate_buffer(ctx,weights,batch,"FT entry weights")
+        || validate_i32_buffer(ctx,ai,batch*active,"FT stm indices") || validate_i32_buffer(ctx,bi,batch*active,"FT nstm indices")
+        || validate_i32_buffer(ctx,counts,ft+1,"FT saturation counts") || validate_i32_buffer(ctx,streaks,ft,"FT saturation streaks")
+        || validate_buffer(ctx,gw,inputs*ft,"FT weight gradient") || validate_buffer(ctx,gb,ft,"FT bias gradient")) return -1;
+    auto status=cudaMemsetAsync(counts->ptr,0,(ft+1)*sizeof(int),ctx->stream);
+    if(status!=cudaSuccess) return fail("FT saturation count reset",status);
+    ft_guard_count<<<dim3((ft+31)/32,32),dim3(32,8),0,ctx->stream>>>(a->ptr,b->ptr,weights->ptr,counts->ptr,batch,ft);
+    if(check_kernel_launch("FT saturation count")) return -1;
+    ft_guard_streak<<<(ft+255)/256,256,0,ctx->stream>>>(counts->ptr,streaks->ptr,ft,rate,patience);
+    if(check_kernel_launch("FT saturation streak")) return -1;
+    ft_guard_gradient<<<dim3((batch+255)/256,ft),256,0,ctx->stream>>>(a->ptr,b->ptr,weights->ptr,
+        ai->ptr,bi->ptr,streaks->ptr,gw->ptr,gb->ptr,batch,ft,active,inputs,ft_alpha,strength,patience);
+    return check_kernel_launch("FT saturation gradient");
+}
+
 __global__ void clip_effective_l1_kernel(float* w,float* slow,const float* shared,const float* shared_slow,
     size_t n,size_t cols,size_t outputs,float alpha) {
     const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;

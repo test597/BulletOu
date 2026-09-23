@@ -1,5 +1,7 @@
 # L2/L3 optimizer centering
 
+The optional [persistent FT saturation penalty](ft-saturation-penalty.md) can be A/B tested alongside centering. This separate activation penalty is OFF by default.
+
 ## Optional folded L1 weight projection
 
 `--sfnn-l1-effective-weight-clip` (JSON: `"sfnn_l1_effective_weight_clip": true`) is **OFF by default**. It is separate from the legacy optimizer clipping disabled by centering.

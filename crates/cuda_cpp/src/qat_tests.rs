@@ -13,6 +13,51 @@ fn batch() -> SfnnTrainStepHostBatch<'static> {
 }
 
 #[test]
+#[ignore = "requires CUDA; tiny synthetic model"]
+fn ft_guard_runner_paths_accumulation_center_qat_and_restore() {
+    let ctx=Context::new(0).unwrap();
+    let upload=Context::new(0).unwrap();
+    for path in 0..3 {
+        let mut host=tiny_sfnn_weights(tiny_sfnn_shape());
+        host.l2fw=None;host.l2fb=None;host.l3fw=None;host.l3fb=None;
+        let w=vec![0.0;host.l0w.len()]; let b=vec![2.0;host.l0b.len()];
+        host.l0w=&w;host.l0b=&b;
+        let mut r=SfnnTrainStepRunner::new(&ctx,host,4,3).unwrap();
+        let snapshot=r.snapshot_device(&ctx).unwrap();
+        let policy=SfnnLayerLrMultipliers { ft_saturation_penalty:1.0,ft_saturation_patience:1,
+            l1_center:true,l2_l3_center:true,qat_l1:true,..Default::default() };
+        let mut p=RangerUpdateParams::default();
+        p.radam.learning_rate=0.001;
+        for micro in 1..=4 {
+            match path {
+                0=>r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,p,
+                    ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(),true,false,policy).unwrap(),
+                1=>r.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,&upload,p,
+                    ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(),true,false,policy).unwrap(),
+                _=>{r.step_profiled_no_readback_with_update_and_lr_multipliers(&ctx,p,
+                    ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(),false,policy).unwrap();},
+            }
+            // Ordinary task gradients are zero at FT z=2; only the hinge contributes.
+            let expected=micro as f32 * batch().entry_weights.iter().sum::<f32>() / (4*r.shape.ft_size) as f32;
+            for g in r.backward_workspace.l0b_gradients.download(&ctx).unwrap() {
+                assert!((g-expected).abs()<1e-6,"path={path} batch={micro} {g}!={expected}");
+            }
+        }
+        p.radam.gradient_factor=0.25;
+        r.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,p,policy,None).unwrap();
+        assert!(r.read_weights(&ctx).unwrap().l0b.iter().all(|v|*v<2.0));
+        assert!(r.ft_saturation_guard.is_some());
+        r.copy_state_from_device(&ctx,&snapshot).unwrap();
+        assert!(r.ft_saturation_guard.is_none());
+        let off=SfnnLayerLrMultipliers { ft_saturation_penalty:0.0,..policy };
+        r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,p,
+            ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(),true,false,off).unwrap();
+        assert!(r.ft_saturation_guard.is_none());
+        assert!(r.backward_workspace.l0b_gradients.download(&ctx).unwrap().iter().all(|g|*g==0.0));
+    }
+}
+
+#[test]
 #[ignore = "requires a CUDA-capable NVIDIA GPU"]
 fn sfnn_effective_clip_qat_center_accumulated_update_and_freeze() {
     let ctx=Context::new(0).unwrap();

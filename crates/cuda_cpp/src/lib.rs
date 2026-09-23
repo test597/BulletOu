@@ -6107,6 +6107,7 @@ pub struct SfnnTrainStepRunner {
     output_center_batches: usize,
     l1_center_buffers: Option<(F32Buffer, F32Buffer)>,
     l1_center_batches: usize,
+    ft_saturation_guard: Option<ft_saturation_guard::State>,
     output_center_bucketwise: bool,
     pending_gradient_batches: usize,
     pub shape: SfnnForwardShape,
@@ -6197,6 +6198,9 @@ pub struct SfnnLayerLrMultipliers {
     pub l1_center: bool,
     /// Project folded L1 fast/slow weights after updates; does not change biases or moments.
     pub l1_effective_weight_clip: bool,
+    pub ft_saturation_penalty: f32,
+    pub ft_saturation_rate: f32,
+    pub ft_saturation_patience: usize,
     pub norm_loss_strength: f32,
     pub l0: f32,
     pub l1: f32,
@@ -6219,6 +6223,9 @@ impl Default for SfnnLayerLrMultipliers {
             l2_l3_center: false,
             l1_center: false,
             l1_effective_weight_clip: false,
+            ft_saturation_penalty: 0.0,
+            ft_saturation_rate: 0.99,
+            ft_saturation_patience: 8,
             norm_loss_strength: 0.0,
             l0: 1.0,
             l1: 1.0,
@@ -6236,6 +6243,14 @@ impl Default for SfnnLayerLrMultipliers {
 
 impl SfnnLayerLrMultipliers {
     pub fn validate(self) -> Result<()> {
+        if !self.ft_saturation_penalty.is_finite() || self.ft_saturation_penalty < 0.0
+            || !self.ft_saturation_rate.is_finite() || self.ft_saturation_rate <= 0.0 || self.ft_saturation_rate > 1.0
+            || self.ft_saturation_patience == 0 || self.ft_saturation_patience > i32::MAX as usize {
+            return Err(CudaCppError::message("FT saturation guard requires finite strength >=0, rate in (0,1], and patience in 1..=2147483647"));
+        }
+        if self.ft_saturation_penalty > 0.0 && self.update_scope != SfnnUpdateScope::All {
+            return Err(CudaCppError::message("FT saturation guard requires update scope all"));
+        }
         if !self.norm_loss_strength.is_finite() || self.norm_loss_strength < 0.0 {
             return Err(CudaCppError::message("SFNN norm loss strength must be finite and non-negative"));
         }
@@ -6448,6 +6463,7 @@ impl SfnnTrainStepRunner {
             output_center_batches: 0,
             l1_center_buffers: None,
             l1_center_batches: 0,
+            ft_saturation_guard: None,
             output_center_bucketwise: std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref()==Ok("1"),
             pending_gradient_batches: 0,
             experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu")
@@ -7006,6 +7022,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
+        self.ft_saturation_guard = None;
         self.l1_center_batches = 0;
         self.output_center_batches = 0;
         self.pending_gradient_batches = 0;
@@ -7028,6 +7045,7 @@ impl SfnnTrainStepRunner {
         factorizer: SfnnFactorizerActive,
         factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<()> {
+        self.ft_saturation_guard = None;
         self.l1_center_batches = 0;
         self.output_center_batches = 0;
         self.pending_gradient_batches = 0;
@@ -7204,6 +7222,7 @@ impl SfnnTrainStepRunner {
             self.factorizer_axis_confidences(),
             &self.entry_weights,
         )?;
+        ft_saturation_guard::apply(self, ctx, lr_multipliers, None)?;
         experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
         l1_center::accumulate(self, ctx, lr_multipliers.l1_center)?;
         self.pending_gradient_batches += 1;
@@ -7378,6 +7397,7 @@ impl SfnnTrainStepRunner {
                 &slot.entry_weights,
             )?;
         }
+        ft_saturation_guard::apply(self, ctx, lr_multipliers, Some(slot_idx))?;
         experimental_output_center::accumulate_from_slot(self, ctx, lr_multipliers.l2_l3_center, Some(slot_idx))?;
         l1_center::accumulate(self, ctx, lr_multipliers.l1_center)?;
         self.pending_gradient_batches += 1;
@@ -7513,6 +7533,7 @@ impl SfnnTrainStepRunner {
             self.factorizer_axis_confidences(),
             false,
         )?;
+        ft_saturation_guard::apply(self, ctx, lr_multipliers, None)?;
         after_backward.record(ctx)?;
         experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
         l1_center::accumulate(self, ctx, lr_multipliers.l1_center)?;
@@ -9096,6 +9117,7 @@ fn check(code: i32) -> Result<()> {
 
 mod experimental_l1_center;
 mod l1_center;
+mod ft_saturation_guard;
 mod experimental_recycle;
 mod experimental_l1_project;
 mod experimental_output_center;
@@ -9158,6 +9180,13 @@ mod ffi {
             rows: usize, cols: usize) -> i32;
         pub fn bulletou_center_scale(ctx:*mut BulletOuCudaCppContext,src:*mut BulletOuCudaCppF32Buffer,
             dst:*mut BulletOuCudaCppF32Buffer,n:usize,scale:f32)->i32;
+        pub fn bulletou_ft_saturation_guard(ctx: *mut BulletOuCudaCppContext,
+            a: *mut BulletOuCudaCppF32Buffer, b: *mut BulletOuCudaCppF32Buffer, weights: *mut BulletOuCudaCppF32Buffer,
+            ai: *mut BulletOuCudaCppI32Buffer, bi: *mut BulletOuCudaCppI32Buffer,
+            counts: *mut BulletOuCudaCppI32Buffer, streaks: *mut BulletOuCudaCppI32Buffer,
+            gw: *mut BulletOuCudaCppF32Buffer, gb: *mut BulletOuCudaCppF32Buffer,
+            batch: usize, ft: usize, active: usize, inputs: usize, ft_alpha: f32,
+            strength: f32, rate: f32, patience: i32) -> i32;
         pub fn bulletou_clip_effective_l1(ctx:*mut BulletOuCudaCppContext,
             w:*mut BulletOuCudaCppF32Buffer,slow:*mut BulletOuCudaCppF32Buffer,
             shared:*mut BulletOuCudaCppF32Buffer,shared_slow:*mut BulletOuCudaCppF32Buffer,

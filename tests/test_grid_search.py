@@ -15,6 +15,13 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_ft_saturation_guard_grid_and_epoch(self):
+        plan = self.plan(["--grid", "sfnn-ft-saturation-penalty", "0", "0.0001", "0.001"])
+        self.assertEqual({t["settings"]["sfnn_ft_saturation_penalty"] for t in plan["trials"]}, {0, 0.0001, 0.001})
+        for key in ("sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience"):
+            self.assertIn(key, grid.EPOCH_SETTING_KEYS)
+            self.assertEqual(grid.resolve_epoch_settings({key: {"epoch1": 1, "epoch2": 2}}, 2)[key], 2)
+
     def test_missing_grid_value_names_the_offending_axis(self):
         args = grid.parse_args(["--settings-file", "unused.json", "--output-folder", "unused",
                                "--grid", "sfnn-l1-effective-weight-clip", "--grid", "warmup_sb", "0"])

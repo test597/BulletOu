@@ -4072,6 +4072,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
+    "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
     "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
@@ -4121,7 +4122,8 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
+        assign!(sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
+            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
@@ -5199,6 +5201,15 @@ struct Args {
     /// Default off. Projects fast and Lookahead slow weights; preserves biases/moments.
     #[arg(long)]
     sfnn_l1_effective_weight_clip: bool,
+    /// Linear activation penalty for persistently saturated FT units (0 disables).
+    #[arg(long, default_value_t = 0.0)]
+    sfnn_ft_saturation_penalty: f32,
+    /// Minimum saturated fraction of eligible training perspectives, in (0,1].
+    #[arg(long, default_value_t = 0.99)]
+    sfnn_ft_saturation_rate: f32,
+    /// Consecutive training microbatches required before applying the FT penalty.
+    #[arg(long, default_value_t = 8)]
+    sfnn_ft_saturation_patience: usize,
 
     /// Quantized i8 threshold used by `--sfnn-saturation-penalty`, in QB
     /// units. 127 means only weights that would hit the i8 edge are
@@ -5322,6 +5333,16 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if !self.sfnn_ft_saturation_penalty.is_finite() || self.sfnn_ft_saturation_penalty < 0.0
+            || !self.sfnn_ft_saturation_rate.is_finite() || self.sfnn_ft_saturation_rate <= 0.0
+            || self.sfnn_ft_saturation_rate > 1.0 || self.sfnn_ft_saturation_patience == 0
+            || self.sfnn_ft_saturation_patience > i32::MAX as usize {
+            return Err("FT saturation guard requires --sfnn-ft-saturation-penalty >= 0 (finite), --sfnn-ft-saturation-rate in (0,1], and --sfnn-ft-saturation-patience in 1..=2147483647".into());
+        }
+        if self.sfnn_ft_saturation_penalty > 0.0 && (self.backend != BackendKind::CudaCpp
+            || !self.eval_type().uses_layerstack() || self.sfnn_update_scope != SfnnUpdateScopeArg::All) {
+            return Err("--sfnn-ft-saturation-penalty requires cuda-cpp SFNN and --sfnn-update-scope all".into());
+        }
         if self.sfnn_init_l2_l3_glorot && (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()) {
             return Err("--sfnn-init-l2-l3-glorot requires --backend cuda-cpp and an SFNN arch".into());
         }
@@ -24609,6 +24630,8 @@ fn cuda_cpp_should_profile_sfnn_diagnostics(args: &Args, progress: Option<CudaCp
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn print_sfnn_qat_mode(args: &Args) {
+    print_startup_kv("FT saturation guard", &format!("strength={}, rate={}, patience={} training batches; mean over batch x 2 views x FT units; history resets on restore",
+        args.sfnn_ft_saturation_penalty, args.sfnn_ft_saturation_rate, args.sfnn_ft_saturation_patience));
     print_startup_kv("L1 effective weight clip", if args.sfnn_l1_effective_weight_clip {
         "on: folded residual+alpha*shared in [-2, 1.984375]; fast/slow post-update; bias/moments unchanged"
     } else { "off" });
@@ -24637,6 +24660,9 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
         l2_l3_center: args.sfnn_l2_l3_center,
         l1_center: args.sfnn_l1_center,
         l1_effective_weight_clip: args.sfnn_l1_effective_weight_clip,
+        ft_saturation_penalty: args.sfnn_ft_saturation_penalty,
+        ft_saturation_rate: args.sfnn_ft_saturation_rate,
+        ft_saturation_patience: args.sfnn_ft_saturation_patience,
         norm_loss_strength: args.sfnn_norm_loss_strength,
         l1: args.sfnn_l1_lr_mult,
         update_scope: args.sfnn_update_scope.into(),
@@ -25353,6 +25379,9 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_l2_l3_center={}", args.sfnn_l2_l3_center),
         format!("sfnn_l1_center={}", args.sfnn_l1_center),
         format!("sfnn_l1_effective_weight_clip={}", args.sfnn_l1_effective_weight_clip),
+        format!("sfnn_ft_saturation_penalty={}", args.sfnn_ft_saturation_penalty),
+        format!("sfnn_ft_saturation_rate={}", args.sfnn_ft_saturation_rate),
+        format!("sfnn_ft_saturation_patience={}", args.sfnn_ft_saturation_patience),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
@@ -25606,6 +25635,9 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "sfnn_l2_l3_center=");
     let signature = resume_signature_without_line(&signature, "sfnn_l1_center=");
     let signature = resume_signature_without_line(&signature, "sfnn_l1_effective_weight_clip=");
+    let signature = resume_signature_without_line(&signature, "sfnn_ft_saturation_penalty=");
+    let signature = resume_signature_without_line(&signature, "sfnn_ft_saturation_rate=");
+    let signature = resume_signature_without_line(&signature, "sfnn_ft_saturation_patience=");
     let signature = resume_signature_without_line(&signature, "test_batch_size=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_rate=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_exact=");
@@ -34091,6 +34123,30 @@ mod tests {
         base.epoch_settings_json=Some(serde_json::json!({"sfnn_l1_effective_weight_clip":{"epoch1":false,"epoch2":true}}).to_string());
         assert!(!args_at_epoch(&base,1).unwrap().sfnn_l1_effective_weight_clip);
         assert!(args_at_epoch(&base,2).unwrap().sfnn_l1_effective_weight_clip);
+    }
+
+    #[test]
+    fn ft_saturation_guard_cli_json_epoch_and_constraints() {
+        let mut argv: Vec<std::ffi::OsString> = ["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfka2_1024_8_64_progress8", "--sfnn-factorizer", "shared",
+            "--superbatches", "1", "--max-epochs", "1"].map(Into::into).to_vec();
+        let base=Args::try_parse_from(argv.clone()).unwrap();
+        assert_eq!(base.sfnn_ft_saturation_penalty,0.0);
+        for (key,value) in [("sfnn_ft_saturation_penalty",serde_json::json!(0.001)),
+            ("sfnn_ft_saturation_rate",serde_json::json!(0.99)),("sfnn_ft_saturation_patience",serde_json::json!(8))] {
+            bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),key,&value,&mut argv).unwrap();
+        }
+        let mut on=Args::try_parse_from(argv).unwrap();
+        on.sfnn_l1_center=true; on.sfnn_l2_l3_center=true; on.sfnn_qat_l1=true;
+        assert!(on.validate_arch_flags().is_ok());
+        assert_eq!(cuda_cpp_sfnn_layer_lr_multipliers(&on,None).ft_saturation_penalty,0.001);
+        on.epoch_settings_json=Some(serde_json::json!({"sfnn_ft_saturation_penalty":{"epoch1":0.0,"epoch2":0.002},
+            "sfnn_ft_saturation_patience":{"epoch1":8,"epoch2":4}}).to_string());
+        assert_eq!(args_at_epoch(&on,1).unwrap().sfnn_ft_saturation_penalty,0.0);
+        assert_eq!(args_at_epoch(&on,2).unwrap().sfnn_ft_saturation_penalty,0.002);
+        assert_eq!(args_at_epoch(&on,2).unwrap().sfnn_ft_saturation_patience,4);
+        on.sfnn_ft_saturation_rate=1.1;
+        assert!(on.validate_arch_flags().is_err());
     }
 
     #[test]
