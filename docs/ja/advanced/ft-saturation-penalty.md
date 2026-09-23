@@ -5,14 +5,14 @@ FTのあるunitがほぼ常に上限に達する現象を抑えるための、�
 | JSON設定（CLIでは `_` を `-` に変更） | デフォルト | 意味 |
 |---|---:|---|
 | `sfnn_ft_saturation_penalty` | 0 | penalty強度 λ。0は完全OFF。有限の非負値 |
-| `sfnn_ft_saturation_rate` | 0.99 | 対象unitの上限到達率の閾値。(0,1]。0.99は99% |
-| `sfnn_ft_saturation_patience` | 8 | 閾値以上が連続する学習microbatch数。正の整数 |
+| `sfnn_ft_saturation_rate` | 0.2 | 対象unitの上限到達率の閾値。(0,1]。0.2は20% |
+| `sfnn_ft_saturation_patience` | 1 | 閾値以上が連続する学習microbatch数。正の整数 |
 
 3項目ともepoch別設定に対応します。未来epochの設定は現在の判定に影響しません。
 
 ## 判定と勾配
 
-各学習batchの両視点で、FT各unitの上限到達率を集計します。検証データは判定に使用しません。entry weightが0の局面は判定から除外し、正のentry weightは大きさによらず1局面として数えます。閾値以上が指定batch数連続したunitだけを対象にします。8なら8batch目から有効です。閾値未満、または有効局面がないbatchでは連続数を0に戻します。`batches_per_update=4`でも4microbatchとして数え、sb数やoptimizer更新回数では数えません。
+各学習batchの両視点で、FT各unitの上限到達率を集計します。検証データは判定に使用しません。entry weightが0の局面は判定から除外し、正のentry weightは大きさによらず1局面として数えます。閾値以上が指定batch数連続したunitだけを対象にします。デフォルトでは20%以上になったそのbatchから有効です。閾値未満、または有効局面がないbatchでは連続数を0に戻します。`batches_per_update=4`でも4microbatchとして数え、sb数やoptimizer更新回数では数えません。
 
 FTのclamp前の値を $z_{isu}$、局面数を $B$、FT幅を $F$、両視点を $s$、entry weightを $w_i$、対象unitのマスクを $m_u$ とすると、追加勾配に対応するpenaltyは
 

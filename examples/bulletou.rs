@@ -5205,10 +5205,10 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     sfnn_ft_saturation_penalty: f32,
     /// Minimum saturated fraction of eligible training perspectives, in (0,1].
-    #[arg(long, default_value_t = 0.99)]
+    #[arg(long, default_value_t = 0.2)]
     sfnn_ft_saturation_rate: f32,
     /// Consecutive training microbatches required before applying the FT penalty.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 1)]
     sfnn_ft_saturation_patience: usize,
 
     /// Quantized i8 threshold used by `--sfnn-saturation-penalty`, in QB
@@ -34132,6 +34132,8 @@ mod tests {
             "--superbatches", "1", "--max-epochs", "1"].map(Into::into).to_vec();
         let base=Args::try_parse_from(argv.clone()).unwrap();
         assert_eq!(base.sfnn_ft_saturation_penalty,0.0);
+        assert_eq!(base.sfnn_ft_saturation_rate,0.2);
+        assert_eq!(base.sfnn_ft_saturation_patience,1);
         for (key,value) in [("sfnn_ft_saturation_penalty",serde_json::json!(0.001)),
             ("sfnn_ft_saturation_rate",serde_json::json!(0.99)),("sfnn_ft_saturation_patience",serde_json::json!(8))] {
             bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),key,&value,&mut argv).unwrap();

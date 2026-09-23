@@ -16,6 +16,8 @@ mod tests {
     fn ft_guard_validation() {
         let p = SfnnLayerLrMultipliers::default();
         assert_eq!(p.ft_saturation_penalty, 0.0);
+        assert_eq!(p.ft_saturation_rate, 0.2);
+        assert_eq!(p.ft_saturation_patience, 1);
         assert!(p.validate().is_ok());
         for x in [-1.0, f32::NAN, f32::INFINITY] {
             assert!(SfnnLayerLrMultipliers { ft_saturation_penalty: x, ..p }.validate().is_err());
@@ -24,6 +26,26 @@ mod tests {
             assert!(SfnnLayerLrMultipliers { ft_saturation_rate: x, ..p }.validate().is_err());
         }
         assert!(SfnnLayerLrMultipliers { ft_saturation_patience: 0, ..p }.validate().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; tiny synthetic buffers only"]
+    fn ft_guard_default_includes_twenty_percent_in_first_batch() {
+        let ctx = Context::new(0).unwrap();
+        let a = F32Buffer::from_host(&ctx, &[1.,0., 0.,0., 0.,0., 0.,0., 0.,0.]).unwrap();
+        let weights = F32Buffer::from_host(&ctx, &[1.;5]).unwrap();
+        let indices = I32Buffer::from_host(&ctx, &[0;5]).unwrap();
+        let counts = I32Buffer::new(&ctx,3).unwrap();
+        let streaks = I32Buffer::from_host(&ctx,&[0,0]).unwrap();
+        let gw = F32Buffer::from_host(&ctx,&[0.;2]).unwrap();
+        let gb = F32Buffer::from_host(&ctx,&[0.;2]).unwrap();
+        let p = SfnnLayerLrMultipliers::default();
+        check(unsafe { ffi::bulletou_ft_saturation_guard(ctx.as_ptr(),a.as_ptr(),a.as_ptr(),weights.as_ptr(),
+            indices.as_ptr(),indices.as_ptr(),counts.as_ptr(),streaks.as_ptr(),gw.as_ptr(),gb.as_ptr(),
+            5,2,1,1,1.,20.,p.ft_saturation_rate,p.ft_saturation_patience as i32) }).unwrap();
+        assert_eq!(counts.download(&ctx).unwrap(),vec![2,0,10]);
+        assert_eq!(streaks.download(&ctx).unwrap(),vec![1,0]);
+        assert_eq!(gb.download(&ctx).unwrap(),vec![2.,0.]);
     }
 
     #[test]

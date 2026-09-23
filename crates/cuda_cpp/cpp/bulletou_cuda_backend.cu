@@ -11108,7 +11108,9 @@ __global__ void ft_guard_count(const float* a,const float* b,const float* weight
 __global__ void ft_guard_streak(const int* counts,int* streaks,size_t ft,float rate,int patience) {
     const size_t u=blockIdx.x*blockDim.x+threadIdx.x;
     if(u>=ft) return;
-    if(counts[ft]>0 && double(counts[u])>=double(rate)*counts[ft])
+    // Compare in the rate's f32 representation so exact fractions such as 2/10
+    // qualify at rate=0.2f (promoting 0.2f to double would exclude that boundary).
+    if(counts[ft]>0 && float(counts[u])/float(counts[ft])>=rate)
         streaks[u]=streaks[u]<patience?streaks[u]+1:patience;
     else streaks[u]=0;
 }

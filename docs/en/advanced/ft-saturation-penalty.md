@@ -5,10 +5,12 @@ This opt-in linear hinge penalty targets FT units that remain almost always uppe
 | JSON key (replace underscores with hyphens for CLI) | Default | Meaning |
 |---|---:|---|
 | `sfnn_ft_saturation_penalty` | 0 | Finite nonnegative strength λ; zero disables all extra work |
-| `sfnn_ft_saturation_rate` | 0.99 | Training upper-saturation fraction threshold, in (0,1] |
-| `sfnn_ft_saturation_patience` | 8 | Positive number of consecutive training microbatches |
+| `sfnn_ft_saturation_rate` | 0.2 | Training upper-saturation fraction threshold, in (0,1]; 0.2 means 20% |
+| `sfnn_ft_saturation_patience` | 1 | Positive number of consecutive training microbatches |
 
 All three support epoch schedules. Future settings do not affect earlier epochs.
+
+By default, a unit qualifies immediately in a batch with at least 20% upper saturation.
 
 For each training microbatch, count upper-saturated activations per FT unit across both perspectives. Validation data is not used. Zero entry weights are excluded from detection; positive weights count equally. A unit becomes eligible on the Nth consecutive qualifying batch. Falling below the threshold, or an entirely filtered batch, resets its streak. With bpu=4, four microbatches count as four, not one optimizer update.
 
