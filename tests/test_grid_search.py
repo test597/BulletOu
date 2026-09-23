@@ -15,6 +15,17 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_missing_grid_value_names_the_offending_axis(self):
+        args = grid.parse_args(["--settings-file", "unused.json", "--output-folder", "unused",
+                               "--grid", "sfnn-l1-effective-weight-clip", "--grid", "warmup_sb", "0"])
+        with self.assertRaises(ValueError) as raised:
+            grid.collect_axes(args)
+        message = str(raised.exception)
+        self.assertIn("--grid sfnn-l1-effective-weight-clip: missing value(s)", message)
+        self.assertIn("--grid sfnn-l1-effective-weight-clip true", message)
+        self.assertIn("--grid sfnn-l1-effective-weight-clip false true", message)
+        self.assertNotIn("warmup_sb", message)
+
     def test_effective_weight_clip_grid(self):
         plan = self.plan(["--grid", "sfnn-l1-effective-weight-clip", "false", "true"])
         self.assertEqual({t["settings"]["sfnn_l1_effective_weight_clip"] for t in plan["trials"]}, {False, True})

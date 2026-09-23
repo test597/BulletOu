@@ -129,7 +129,15 @@ def collect_axes(args) -> dict:
                if getattr(args, option) is not None]
     for entry in args.grid:
         if len(entry) < 2:
-            raise ValueError("--grid requires an option name and at least one value")
+            if entry:
+                option = entry[0]
+                raise ValueError(
+                    f"--grid {option}: missing value(s) after '{option}'. "
+                    f"Use --grid {option} VALUE [VALUE ...]. "
+                    f"For a boolean option, use --grid {option} true "
+                    f"(enable only) or --grid {option} false true (A/B comparison)."
+                )
+            raise ValueError("--grid: missing option name and values; use --grid OPTION VALUE [VALUE ...]")
         entries.append((key_name(entry[0]), entry[1:]))
     for key, raw_values in entries:
         if key in FORBIDDEN_GRID:
