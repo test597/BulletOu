@@ -12,6 +12,45 @@ fn batch() -> SfnnTrainStepHostBatch<'static> {
     }
 }
 
+#[test]
+#[ignore = "requires a CUDA-capable NVIDIA GPU"]
+fn sfnn_effective_clip_qat_center_accumulated_update_and_freeze() {
+    let ctx=Context::new(0).unwrap();
+    let upload=Context::new(0).unwrap();
+    for bpu in [1,4] {
+        let mut host=tiny_sfnn_weights(tiny_sfnn_shape());
+        host.l2fw=None; host.l2fb=None; host.l3fw=None; host.l3fb=None;
+        let w=vec![4.0;host.l1w.len()];
+        host.l1w=&w;
+        let mut r=SfnnTrainStepRunner::new(&ctx,host,4,3).unwrap();
+        let policy=SfnnLayerLrMultipliers{l1_center:true,l2_l3_center:true,qat_l1:true,l1_effective_weight_clip:true,..Default::default()};
+        let mut p=RangerUpdateParams::default();
+        p.radam.learning_rate=0.01;
+        for update in 1..=8 {
+            p.radam.step=update;
+            for micro in 0..bpu {
+                r.step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+                    &ctx,&upload,p,ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(),true,micro+1==bpu,policy,Some(&[0,1])).unwrap();
+                if update==1 && micro+1<bpu {assert_eq!(r.read_weights(&ctx).unwrap().l1w,w);}
+            }
+            for (buffer, shared) in [(&r.weights.l1w,r.weights.l1fw.as_ref().unwrap()),
+                (&r.optimizer_states.l1w.slow_params,&r.optimizer_states.l1fw.as_ref().unwrap().slow_params)] {
+                let f=shared.download(&ctx).unwrap();
+                let cols=r.shape.ft_size; let outputs=r.shape.l1_out();
+                for (i,x) in buffer.download(&ctx).unwrap().iter().enumerate() {
+                    let effective=x+f[(i%cols)*outputs+(i/cols)%outputs];
+                    assert!((-2.000001..=127.0/64.0+0.000001).contains(&effective),"{effective}");
+                }
+            }
+            assert!(r.forward_workspace.qat_l1.as_ref().unwrap().refresh.get());
+        }
+        let before=r.read_weights(&ctx).unwrap().l1w;
+        let frozen=SfnnLayerLrMultipliers{l1:0.0,..policy};
+        r.step_profiled_no_readback_with_update_and_lr_multipliers(&ctx,p,ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(),true,frozen).unwrap();
+        assert_eq!(r.read_weights(&ctx).unwrap().l1w,before);
+    }
+}
+
 fn host_batch() -> SfnnForwardHostBatch<'static> {
     let b = batch();
     SfnnForwardHostBatch {

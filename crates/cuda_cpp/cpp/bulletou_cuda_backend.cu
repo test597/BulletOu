@@ -11076,6 +11076,38 @@ extern "C" int bulletou_cuda_cpp_rebase_shared_device(
     return check_kernel_launch("shared rebase scale");
 }
 
+__global__ void clip_effective_l1_kernel(float* w,float* slow,const float* shared,const float* shared_slow,
+    size_t n,size_t cols,size_t outputs,float alpha) {
+    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
+    if(i>=n) return;
+    const size_t si=(i%cols)*outputs+(i/cols)%outputs;
+    const float f=shared ? alpha*shared[si] : 0.0f;
+    const float s=shared_slow ? alpha*shared_slow[si] : 0.0f;
+    // Preserve in-range masters bit-for-bit. Do not fold the correction into bias.
+    const float v=w[i]+f, vs=slow[i]+s;
+    if(v < -2.0f) w[i]=-2.0f-f;
+    else if(v > 127.0f/64.0f) w[i]=127.0f/64.0f-f;
+    if(vs < -2.0f) slow[i]=-2.0f-s;
+    else if(vs > 127.0f/64.0f) slow[i]=127.0f/64.0f-s;
+}
+
+extern "C" int bulletou_clip_effective_l1(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w,BulletOuCudaCppF32Buffer* slow,
+    BulletOuCudaCppF32Buffer* shared,BulletOuCudaCppF32Buffer* shared_slow,
+    size_t cols,size_t outputs,float alpha) {
+    if(!ctx || !w || !cols || !outputs || cols>SIZE_MAX/outputs || !std::isfinite(alpha)
+        || w->len%(cols*outputs) || (shared==nullptr)!=(shared_slow==nullptr))
+        return fail_message("invalid effective L1 clip shape");
+    if(validate_buffer(ctx,w,w->len,"effective L1") || validate_buffer(ctx,slow,w->len,"slow effective L1")) return -1;
+    if(shared && (validate_buffer(ctx,shared,cols*outputs,"shared L1") ||
+        validate_buffer(ctx,shared_slow,cols*outputs,"slow shared L1"))) return -1;
+    int blocks=0;
+    if(block_count_1d(w->len,256,&blocks,"effective L1 clip")) return -1;
+    clip_effective_l1_kernel<<<blocks,256,0,ctx->stream>>>(w->ptr,slow->ptr,shared?shared->ptr:nullptr,
+        shared_slow?shared_slow->ptr:nullptr,w->len,cols,outputs,alpha);
+    return check_kernel_launch("effective L1 clip");
+}
+
 __device__ void center_affine_row(float* w,float* b,float* sw,float* sb,float* gw,
     const float* gb,const float* c,size_t row,size_t rows,size_t cols,bool before,bool column_major) {
     __shared__ float fast[256];

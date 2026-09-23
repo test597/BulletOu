@@ -1,5 +1,24 @@
 # L2/L3 optimizer centering
 
+## Optional folded L1 weight projection
+
+`--sfnn-l1-effective-weight-clip` (JSON: `"sfnn_l1_effective_weight_clip": true`) is **OFF by default**. It is separate from the legacy optimizer clipping disabled by centering.
+
+After each optimizer/Lookahead update and conversion back from centered coordinates, it projects `effective = residual + alpha*shared` into `[-2, 127/64]`, writing `residual = clamp(effective) - alpha*shared`. Shared weights remain unchanged. Both fast and slow weights are projected using their respective shared weights. In-range weights are left untouched; floating-point cancellation can introduce small numerical differences.
+
+Only L1 weights are affected. Biases, FT/L2/L3, momentum/variance states, and identity STE are unchanged; no compensating bias shift is made. Supports cuda-cpp dense L1, none/shared, update-scope=all, no count gates or axis/pair. QAT/centering are optional. With gradient accumulation, projection occurs only on optimizer updates; frozen L1 (zero LR multiplier) is not projected. Loading a checkpoint alone does not project it: the first L1 update does. No checkpoint format changes, large scratch buffers, or host weight readbacks are required.
+
+Epoch boolean schedules and resume toggling are supported. The option is recorded in the startup output and resume signature. A/B test in a new grid root:
+
+```powershell
+python .\grid_search.py `
+  --settings-file <common-settings.json> `
+  --output-folder <new-grid-root> `
+  --grid sfnn-l1-effective-weight-clip false true
+```
+
+Keep other conditions identical. Judge quantized accuracy/loss, saturation, and playing strength, not merely agreement between FP32 and quantized metrics. Optimizer histories are retained when enabling this on resume.
+
 ## A/B testing L1 centering
 
 `--sfnn-l1-center` (JSON: `"sfnn_l1_center": true`, default OFF) applies the same optimizer-coordinate transformation to L1. It is independent of, and can be combined with, L2/L3 centering.

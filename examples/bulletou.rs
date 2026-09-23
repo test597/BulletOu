@@ -4072,7 +4072,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
-    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center",
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
@@ -4091,7 +4091,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if epoch.is_none() || name != &format!("epoch{}", epoch.unwrap()) {
             return Err(format!("invalid epoch key `{name}` in `{key}`; use epoch1, epoch2, ..."));
         }
-        let boolean = matches!(key, "sfnn_qat_l1" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center");
+        let boolean = matches!(key, "sfnn_qat_l1" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
         }
@@ -4121,7 +4121,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center,
+        assign!(lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
@@ -5195,6 +5195,11 @@ struct Args {
     #[arg(long)]
     sfnn_l1_center: bool,
 
+    /// Clip folded L1 weights (residual + alpha*shared) to [-2,127/64] after updates.
+    /// Default off. Projects fast and Lookahead slow weights; preserves biases/moments.
+    #[arg(long)]
+    sfnn_l1_effective_weight_clip: bool,
+
     /// Quantized i8 threshold used by `--sfnn-saturation-penalty`, in QB
     /// units. 127 means only weights that would hit the i8 edge are
     /// penalized; lower values start damping earlier.
@@ -5319,6 +5324,15 @@ impl Args {
     fn validate_arch_flags(&self) -> Result<(), String> {
         if self.sfnn_init_l2_l3_glorot && (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()) {
             return Err("--sfnn-init-l2-l3-glorot requires --backend cuda-cpp and an SFNN arch".into());
+        }
+        if self.sfnn_l1_effective_weight_clip {
+            let spec = effective_sfnn_factorizer_spec(self);
+            if self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()
+                || self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some()
+                || (spec != SfnnFactorizerSpec::NONE && spec != SfnnFactorizerSpec::SHARED)
+                || self.sfnn_bucket_counts.is_some() || self.sfnn_update_scope != SfnnUpdateScopeArg::All {
+                return Err("--sfnn-l1-effective-weight-clip requires cuda-cpp dense SFNN L1, none/shared, no bucket counts and update-scope=all".into());
+            }
         }
         if self.sfnn_l2_l3_center || self.sfnn_l1_center {
             if self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack() {
@@ -24595,6 +24609,9 @@ fn cuda_cpp_should_profile_sfnn_diagnostics(args: &Args, progress: Option<CudaCp
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn print_sfnn_qat_mode(args: &Args) {
+    print_startup_kv("L1 effective weight clip", if args.sfnn_l1_effective_weight_clip {
+        "on: folded residual+alpha*shared in [-2, 1.984375]; fast/slow post-update; bias/moments unchanged"
+    } else { "off" });
     print_startup_kv("L1 centering", if args.sfnn_l1_center {
         "on: GPU accumulated-batch global input mean; residual/shared optimizer coordinates; folded forward/export"
     } else { "off" });
@@ -24619,6 +24636,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
     let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers {
         l2_l3_center: args.sfnn_l2_l3_center,
         l1_center: args.sfnn_l1_center,
+        l1_effective_weight_clip: args.sfnn_l1_effective_weight_clip,
         norm_loss_strength: args.sfnn_norm_loss_strength,
         l1: args.sfnn_l1_lr_mult,
         update_scope: args.sfnn_update_scope.into(),
@@ -25334,6 +25352,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_qat_l1={}", args.sfnn_qat_l1),
         format!("sfnn_l2_l3_center={}", args.sfnn_l2_l3_center),
         format!("sfnn_l1_center={}", args.sfnn_l1_center),
+        format!("sfnn_l1_effective_weight_clip={}", args.sfnn_l1_effective_weight_clip),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
@@ -25586,6 +25605,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     // Centering can be explicitly changed on resume; tensors remain folded.
     let signature = resume_signature_without_line(&signature, "sfnn_l2_l3_center=");
     let signature = resume_signature_without_line(&signature, "sfnn_l1_center=");
+    let signature = resume_signature_without_line(&signature, "sfnn_l1_effective_weight_clip=");
     let signature = resume_signature_without_line(&signature, "test_batch_size=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_rate=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_exact=");
@@ -34051,6 +34071,26 @@ mod tests {
         let enabled=Args::try_parse_from(argv).unwrap();
         assert!(enabled.verbose);
         assert_eq!(resume_signature(&base),resume_signature(&enabled));
+    }
+
+    #[test]
+    fn l1_effective_weight_clip_cli_json_epoch() {
+        let mut argv: Vec<std::ffi::OsString> = ["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfka2_1024_8_64_progress8", "--sfnn-factorizer", "shared",
+            "--superbatches", "1", "--max-epochs", "1"].map(Into::into).to_vec();
+        let mut base=Args::try_parse_from(argv.clone()).unwrap();
+        assert!(!base.sfnn_l1_effective_weight_clip);
+        bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),"sfnn_l1_effective_weight_clip",&serde_json::json!(true),&mut argv).unwrap();
+        let mut on=Args::try_parse_from(argv).unwrap();
+        assert!(on.validate_arch_flags().is_ok());
+        assert!(cuda_cpp_sfnn_layer_lr_multipliers(&on,None).l1_effective_weight_clip);
+        on.sfnn_l1_center=true;
+        on.sfnn_l2_l3_center=true;
+        on.sfnn_qat_l1=true;
+        assert!(on.validate_arch_flags().is_ok());
+        base.epoch_settings_json=Some(serde_json::json!({"sfnn_l1_effective_weight_clip":{"epoch1":false,"epoch2":true}}).to_string());
+        assert!(!args_at_epoch(&base,1).unwrap().sfnn_l1_effective_weight_clip);
+        assert!(args_at_epoch(&base,2).unwrap().sfnn_l1_effective_weight_clip);
     }
 
     #[test]

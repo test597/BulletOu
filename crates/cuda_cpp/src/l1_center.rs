@@ -3,6 +3,23 @@
 use super::*;
 use experimental_output_center::{mean_into, scale_into};
 
+pub(super) fn validate_effective_clip(r: &SfnnTrainStepRunner, lr: SfnnLayerLrMultipliers) -> Result<()> {
+    if r.shape.has_compact_l1() || r.factorizer.any_axis() || r.residual_count_gates_enabled
+        || lr.update_scope != SfnnUpdateScope::All {
+        return Err(CudaCppError::message("L1 effective weight clip requires dense L1, none/shared, no count gates, update-scope=all"));
+    }
+    Ok(())
+}
+
+pub(super) fn clip_effective_weights(r: &SfnnTrainStepRunner, ctx: &Context) -> Result<()> {
+    let (shared, slow) = if r.factorizer.shared {
+        (r.weights.l1fw.as_ref().unwrap().as_ptr(), r.optimizer_states.l1fw.as_ref().unwrap().slow_params.as_ptr())
+    } else { (std::ptr::null_mut(), std::ptr::null_mut()) };
+    check(unsafe { ffi::bulletou_clip_effective_l1(ctx.as_ptr(), r.weights.l1w.as_ptr(),
+        r.optimizer_states.l1w.slow_params.as_ptr(), shared, slow,
+        r.shape.ft_size, r.shape.l1_out(), r.factorizer_alpha.shared) })
+}
+
 pub(super) fn accumulate(r: &mut SfnnTrainStepRunner, ctx: &Context, enabled: bool) -> Result<()> {
     if !enabled {
         r.l1_center_batches = 0;
@@ -90,6 +107,31 @@ pub(super) fn transform(r: &SfnnTrainStepRunner, ctx: &Context, before: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn effective_clip_fast_slow_shared_alpha_and_noop() {
+        let ctx=Context::new(0).unwrap();
+        for enabled_shared in [false,true] {
+            for alpha in [0.0,0.5,2.0] {
+                let values=vec![-4.0,0.125,4.0,0.0,3.0,-3.0,1.0,-1.0];
+                let shared_values=vec![0.25,-0.5,0.75,0.125];
+                let w=F32Buffer::from_host(&ctx,&values).unwrap();
+                let slow=F32Buffer::from_host(&ctx,&values.iter().map(|x|-x).collect::<Vec<_>>()).unwrap();
+                let shared=F32Buffer::from_host(&ctx,&shared_values).unwrap();
+                let ss=F32Buffer::from_host(&ctx,&shared_values.iter().map(|x|2.0*x).collect::<Vec<_>>()).unwrap();
+                let ptr=|x:&F32Buffer| if enabled_shared{x.as_ptr()}else{std::ptr::null_mut()};
+                check(unsafe{ffi::bulletou_clip_effective_l1(ctx.as_ptr(),w.as_ptr(),slow.as_ptr(),ptr(&shared),ptr(&ss),2,2,alpha)}).unwrap();
+                for (got,sign,factor) in [(w.download(&ctx).unwrap(),1.0,1.0),(slow.download(&ctx).unwrap(),-1.0,2.0)] {
+                    for i in 0..8 {
+                        let f=if enabled_shared{alpha*factor*shared_values[(i%2)*2+(i/2)%2]}else{0.0};
+                        assert_eq!(got[i]+f,(sign*values[i]+f).clamp(-2.0,127.0/64.0));
+                        if (-2.0..=127.0/64.0).contains(&(sign*values[i]+f)){assert_eq!(got[i],sign*values[i]);}
+                    }
+                }
+                assert_eq!(shared.download(&ctx).unwrap(),shared_values);
+            }
+        }
+    }
     #[test]
     fn fused_groups_match_independent_host_reference() {
         let ctx = Context::new(0).unwrap();

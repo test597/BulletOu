@@ -15,6 +15,10 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_effective_weight_clip_grid(self):
+        plan = self.plan(["--grid", "sfnn-l1-effective-weight-clip", "false", "true"])
+        self.assertEqual({t["settings"]["sfnn_l1_effective_weight_clip"] for t in plan["trials"]}, {False, True})
+
     def test_verbose_is_forwarded_without_changing_trial_identity(self):
         normal = self.plan([])
         verbose = self.plan(["--verbose"])
@@ -28,7 +32,7 @@ class GridSearchTests(unittest.TestCase):
     def test_l1_center_grid_and_epoch_booleans(self):
         plan = self.plan(["--grid", "sfnn-l1-center", "false", "true"])
         self.assertEqual({t["settings"]["sfnn_l1_center"] for t in plan["trials"]}, {False, True})
-        for key in ("sfnn_l1_center", "sfnn_l2_l3_center"):
+        for key in ("sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
             values = {key: {"epoch1": False, "epoch2": True}}
             self.assertFalse(grid.resolve_epoch_settings(values, 1)[key])
             self.assertTrue(grid.resolve_epoch_settings(values, 2)[key])

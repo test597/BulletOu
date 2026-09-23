@@ -6195,6 +6195,8 @@ pub struct SfnnLayerLrMultipliers {
     pub l2_l3_center: bool,
     /// Input-centered optimizer coordinates for dense L1 residual/shared weights.
     pub l1_center: bool,
+    /// Project folded L1 fast/slow weights after updates; does not change biases or moments.
+    pub l1_effective_weight_clip: bool,
     pub norm_loss_strength: f32,
     pub l0: f32,
     pub l1: f32,
@@ -6216,6 +6218,7 @@ impl Default for SfnnLayerLrMultipliers {
         Self {
             l2_l3_center: false,
             l1_center: false,
+            l1_effective_weight_clip: false,
             norm_loss_strength: 0.0,
             l0: 1.0,
             l1: 1.0,
@@ -8072,6 +8075,9 @@ impl SfnnTrainStepRunner {
         }
         self.forward_workspace.invalidate_l1_qat();
         lr_multipliers.validate()?;
+        if lr_multipliers.l1_effective_weight_clip {
+            l1_center::validate_effective_clip(self, lr_multipliers)?;
+        }
         let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;
         self.add_saturation_penalty_gradients(ctx, lr_multipliers, dirty_update)?;
         self.apply_residual_count_gates_to_gradients(ctx, lr_multipliers, dirty_update)?;
@@ -8329,6 +8335,9 @@ impl SfnnTrainStepRunner {
         }
         self.output_center_batches = 0;
         self.l1_center_batches = 0;
+        if lr_multipliers.l1_effective_weight_clip && lr_multipliers.l1 > 0.0 {
+            l1_center::clip_effective_weights(self, ctx)?;
+        }
         self.pending_gradient_batches = 0;
         Ok(())
     }
@@ -9149,6 +9158,10 @@ mod ffi {
             rows: usize, cols: usize) -> i32;
         pub fn bulletou_center_scale(ctx:*mut BulletOuCudaCppContext,src:*mut BulletOuCudaCppF32Buffer,
             dst:*mut BulletOuCudaCppF32Buffer,n:usize,scale:f32)->i32;
+        pub fn bulletou_clip_effective_l1(ctx:*mut BulletOuCudaCppContext,
+            w:*mut BulletOuCudaCppF32Buffer,slow:*mut BulletOuCudaCppF32Buffer,
+            shared:*mut BulletOuCudaCppF32Buffer,shared_slow:*mut BulletOuCudaCppF32Buffer,
+            cols:usize,outputs:usize,alpha:f32)->i32;
         #[cfg(test)]
         pub fn bulletou_center_affine_layout(ctx:*mut BulletOuCudaCppContext,
             w:*mut BulletOuCudaCppF32Buffer,b:*mut BulletOuCudaCppF32Buffer,

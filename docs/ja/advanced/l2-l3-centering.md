@@ -1,5 +1,29 @@
 # L2/L3の中心化
 
+## L1の実効重み制限（QAT併用の比較用）
+
+`--sfnn-l1-effective-weight-clip`（JSON: `"sfnn_l1_effective_weight_clip": true`）は、L1のfold済み重みを量子化可能範囲 `[-2, 127/64]` に制限します。**デフォルトOFF**。中心化が無効にする従来のoptimizer clipとは別機能です。
+
+各optimizer更新・Lookahead更新・中心化の逆変換を終えた後に、`effective = residual + alpha*shared` を制限し、`residual = clamp(effective) - alpha*shared` とします。sharedは保持し、fastとslowそれぞれのsharedを使って両方の個別重みを補正します。範囲内の値は変更しません。浮動小数点の加減算に伴う微差はあり得ます。
+
+- 対象はL1重みのみ。FT/L2/L3、bias、momentum・分散推定、STEは変更しません。biasによる相殺も行いません。
+- cuda-cpp、dense L1、factorizer none/shared、update-scope=allに対応。axis/pair・count gateは非対応。QATや中心化は必須ではありません。
+- BPU>1ではoptimizer更新時だけ適用します。L1 freeze（LR倍率0）中は適用しません。
+- resume直後の読み込みだけでは補正せず、最初のL1 optimizer更新後から適用します。既存ファイルを直接書き換えません。
+- checkpoint/nn.bin形式は変更なし。追加の大型VRAMバッファやCPUへの重み転送はありません。
+- epoch指定（例：`{"epoch1": false, "epoch2": true}`）にも対応。起動時表示とresume signatureへ記録します。
+
+共通設定でQAT・中心化を揃えて、別のgridフォルダで比較できます：
+
+```powershell
+python .\grid_search.py `
+  --settings-file <共通設定.json> `
+  --output-folder <新しい比較フォルダ> `
+  --grid sfnn-l1-effective-weight-clip false true
+```
+
+acc/qaccの差を減らすだけでは成功とは言えません。量子化側の精度・飽和率・棋力で評価してください。optimizer履歴は保持されるため、checkpoint途中からONにする実験と、最初からONの学習は異なります。
+
 ## L1中心化のA/Bテスト
 
 `--sfnn-l1-center`（JSON: `"sfnn_l1_center": true`、デフォルトOFF）で、L1にも同じoptimizer座標の中心化を適用できます。L2/L3中心化とは独立しており、併用も可能です。
