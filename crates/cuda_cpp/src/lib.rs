@@ -7186,6 +7186,7 @@ impl SfnnTrainStepRunner {
         self.targets.upload(ctx, batch.targets)?;
         self.entry_weights.upload(ctx, batch.entry_weights)?;
 
+        let ft_guard = ft_saturation_guard::prepare(self, ctx, lr_multipliers, None)?;
         sfnn_forward_train_device_with_factorizer(
             ctx,
             &self.device_batch,
@@ -7222,7 +7223,7 @@ impl SfnnTrainStepRunner {
             self.factorizer_axis_confidences(),
             &self.entry_weights,
         )?;
-        ft_saturation_guard::apply(self, ctx, lr_multipliers, None)?;
+        ft_guard.finish(self, lr_multipliers, None)?;
         experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
         l1_center::accumulate(self, ctx, lr_multipliers.l1_center)?;
         self.pending_gradient_batches += 1;
@@ -7353,6 +7354,7 @@ impl SfnnTrainStepRunner {
 
         let slot_idx = self.next_upload_slot;
         self.next_upload_slot = (self.next_upload_slot + 1) % self.upload_slots.len();
+        let ft_guard = ft_saturation_guard::prepare(self, ctx, lr_multipliers, Some(slot_idx))?;
         {
             let slot = &mut self.upload_slots[slot_idx];
             slot.upload(upload_ctx, batch)?;
@@ -7397,7 +7399,7 @@ impl SfnnTrainStepRunner {
                 &slot.entry_weights,
             )?;
         }
-        ft_saturation_guard::apply(self, ctx, lr_multipliers, Some(slot_idx))?;
+        ft_guard.finish(self, lr_multipliers, Some(slot_idx))?;
         experimental_output_center::accumulate_from_slot(self, ctx, lr_multipliers.l2_l3_center, Some(slot_idx))?;
         l1_center::accumulate(self, ctx, lr_multipliers.l1_center)?;
         self.pending_gradient_batches += 1;
@@ -7520,6 +7522,7 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
         )?;
         after_loss.record(ctx)?;
+        let ft_guard = ft_saturation_guard::prepare(self, ctx, lr_multipliers, None)?;
         let backward_stages = sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
             ctx,
             &self.device_batch,
@@ -7533,7 +7536,7 @@ impl SfnnTrainStepRunner {
             self.factorizer_axis_confidences(),
             false,
         )?;
-        ft_saturation_guard::apply(self, ctx, lr_multipliers, None)?;
+        ft_guard.finish(self, lr_multipliers, None)?;
         after_backward.record(ctx)?;
         experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
         l1_center::accumulate(self, ctx, lr_multipliers.l1_center)?;
@@ -9180,6 +9183,9 @@ mod ffi {
             rows: usize, cols: usize) -> i32;
         pub fn bulletou_center_scale(ctx:*mut BulletOuCudaCppContext,src:*mut BulletOuCudaCppF32Buffer,
             dst:*mut BulletOuCudaCppF32Buffer,n:usize,scale:f32)->i32;
+        pub fn bulletou_bind_ft_saturation_guard(ctx: *mut BulletOuCudaCppContext,
+            weights: *mut BulletOuCudaCppF32Buffer, counts: *mut BulletOuCudaCppI32Buffer,
+            streaks: *mut BulletOuCudaCppI32Buffer,batch:usize,ft:usize,strength:f32,rate:f32,patience:i32)->i32;
         pub fn bulletou_ft_saturation_guard(ctx: *mut BulletOuCudaCppContext,
             a: *mut BulletOuCudaCppF32Buffer, b: *mut BulletOuCudaCppF32Buffer, weights: *mut BulletOuCudaCppF32Buffer,
             ai: *mut BulletOuCudaCppI32Buffer, bi: *mut BulletOuCudaCppI32Buffer,

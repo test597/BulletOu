@@ -78,7 +78,17 @@ namespace {
 
 thread_local std::string g_last_error;
 
+struct FtSaturationConfig {
+    const float* weights = nullptr;
+    int* counts = nullptr;
+    int* streaks = nullptr;
+    size_t batch = 0, ft = 0;
+    float strength = 0, rate = 0;
+    int patience = 1;
+};
+
 struct BulletOuCudaCppContext {
+    FtSaturationConfig ft_guard;
     float* norm_loss_scratch = nullptr;
     int device = 0;
     cudaStream_t stream = nullptr;
@@ -3867,7 +3877,7 @@ __global__ void sfnn_pairwise_l0_pregrad_kernel(
     float* nstm_pre_gradients,
     float* l0b_gradients,
     size_t batch,
-    size_t ft_size) {
+    size_t ft_size, FtSaturationConfig guard) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
@@ -3892,10 +3902,19 @@ __global__ void sfnn_pairwise_l0_pregrad_kernel(
     float nstm_grad0 = crelu_pre_gradient_from_value(nstm0, nstm_pair_grad * nstm1);
     float nstm_grad1 = crelu_pre_gradient_from_value(nstm1, nstm_pair_grad * nstm0);
 
-    stm_pre_gradients[l0_base + row0] = stm_grad0;
-    stm_pre_gradients[l0_base + row1] = stm_grad1;
-    nstm_pre_gradients[l0_base + row0] = nstm_grad0;
-    nstm_pre_gradients[l0_base + row1] = nstm_grad1;
+    // Hinge bypasses clamp backward, but is still included in the ONE ordinary
+    // sparse weight-gradient gather. Bias penalty was reduced separately to
+    // avoid a contended atomic for every saturated view.
+    float p0=0.0f,p1=0.0f;
+    if(guard.weights && guard.weights[sample]>0.0f) {
+        const float delta=guard.strength*guard.weights[sample]/(2.0f*float(batch)*float(ft_size));
+        if(guard.streaks[row0]>=guard.patience) p0=delta;
+        if(guard.streaks[row1]>=guard.patience) p1=delta;
+    }
+    stm_pre_gradients[l0_base + row0] = stm_grad0 + (stm0>=1.0f?p0:0.0f);
+    stm_pre_gradients[l0_base + row1] = stm_grad1 + (stm1>=1.0f?p1:0.0f);
+    nstm_pre_gradients[l0_base + row0] = nstm_grad0 + (nstm0>=1.0f?p0:0.0f);
+    nstm_pre_gradients[l0_base + row1] = nstm_grad1 + (nstm1>=1.0f?p1:0.0f);
 
     float bias_grad0 = stm_grad0 + nstm_grad0;
     float bias_grad1 = stm_grad1 + nstm_grad1;
@@ -5995,6 +6014,9 @@ int launch_sfnn_apply_residual_count_gates_to_gradients(
     return 0;
 }
 
+int launch_ft_guard_fused_prepare(BulletOuCudaCppContext* ctx,
+    const float* a,const float* b,float* gb,size_t batch,size_t ft);
+
 int launch_sfnn_inverse_index_l0_backward(
     BulletOuCudaCppContext* ctx,
     const int* stm_indices,
@@ -6012,6 +6034,7 @@ int launch_sfnn_inverse_index_l0_backward(
     size_t ft_size, float ft_factorizer_alpha) {
     constexpr int threads = 256;
     int blocks = 0;
+    if(launch_ft_guard_fused_prepare(ctx,stm_l0,nstm_l0,l0b_gradients,batch,ft_size)) return -1;
     if (block_count_1d(batch * (ft_size / 2), threads, &blocks, "sfnn_pairwise_l0_pregrad_kernel") != 0) {
         return -1;
     }
@@ -6023,7 +6046,7 @@ int launch_sfnn_inverse_index_l0_backward(
         nstm_l0_pre_gradients,
         l0b_gradients,
         batch,
-        ft_size);
+        ft_size, ctx->ft_guard);
     if (check_kernel_launch("sfnn_pairwise_l0_pregrad_kernel launch") != 0) {
         return -1;
     }
@@ -6773,7 +6796,7 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
-    if (fuse_pairwise_l0 != 0) {
+    if (fuse_pairwise_l0 != 0 || ctx->ft_guard.weights != nullptr) {
         if (launch_sfnn_inverse_index_l0_backward(
                 ctx,
                 stm_indices,
@@ -11163,6 +11186,43 @@ __global__ void ft_guard_gather_gradient(const float* activation,const float* we
     // Aggregate before writing. At most one base and one virtual-feature
     // atomic per feature/unit, rather than per saturated position/feature/unit.
     if(sum!=0.0f) sfnn_atomic_add_l0w_gradient(gw,feature,inputs,ft,u,sum,ft_alpha);
+}
+
+namespace {
+int launch_ft_guard_fused_prepare(BulletOuCudaCppContext* ctx,
+    const float* a,const float* b,float* gb,size_t batch,size_t ft) {
+    const auto& g=ctx->ft_guard;
+    if(!g.weights) return 0;
+    if(g.batch!=batch || g.ft!=ft) return fail_message("FT guard/backward layout mismatch");
+    auto status=cudaMemsetAsync(g.counts,0,(ft+1)*sizeof(int),ctx->stream);
+    if(status!=cudaSuccess) return fail("FT saturation count reset",status);
+    ft_guard_count<<<dim3((ft+31)/32,32),dim3(32,8),0,ctx->stream>>>(a,b,g.weights,g.counts,batch,ft);
+    if(check_kernel_launch("fused FT saturation count")) return -1;
+    ft_guard_streak<<<(ft+255)/256,256,0,ctx->stream>>>(g.counts,g.streaks,ft,g.rate,g.patience);
+    if(check_kernel_launch("fused FT saturation streak")) return -1;
+    const unsigned row_blocks=static_cast<unsigned>(std::min(size_t(256),(batch+7)/8));
+    ft_guard_bias_gradient<<<dim3((ft+31)/32,row_blocks),dim3(32,8),0,ctx->stream>>>(
+        a,b,g.weights,g.streaks,gb,batch,ft,g.strength,g.patience);
+    return check_kernel_launch("fused FT saturation bias");
+}
+}
+
+// Borrowed pointers are scoped by the Rust runner's RAII binding; clear also
+// on error so another runner sharing this context cannot inherit the policy.
+extern "C" int bulletou_bind_ft_saturation_guard(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* weights,BulletOuCudaCppI32Buffer* counts,
+    BulletOuCudaCppI32Buffer* streaks,size_t batch,size_t ft,float strength,float rate,int patience) {
+    if(!ctx) return fail_message("null FT guard context");
+    ctx->ft_guard={};
+    if(!weights) return 0;
+    if(!batch || batch>INT_MAX/2 || !ft || ft>65535 || patience<1 ||
+        !std::isfinite(strength) || strength<0 || !std::isfinite(rate) || rate<=0 || rate>1)
+        return fail_message("invalid fused FT guard parameters");
+    if(validate_buffer(ctx,weights,batch,"FT guard weights") ||
+        validate_i32_buffer(ctx,counts,ft+1,"FT guard counts") ||
+        validate_i32_buffer(ctx,streaks,ft,"FT guard streaks")) return -1;
+    ctx->ft_guard={weights->ptr,counts->ptr,streaks->ptr,batch,ft,strength,rate,patience};
+    return 0;
 }
 
 extern "C" int bulletou_ft_saturation_guard(BulletOuCudaCppContext* ctx,

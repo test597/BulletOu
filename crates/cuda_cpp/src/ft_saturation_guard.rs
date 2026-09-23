@@ -265,6 +265,105 @@ mod tests {
     }
 }
 
+pub(super) struct Binding<'a> {
+    ctx: &'a Context,
+    reference: bool,
+}
+
+impl Drop for Binding<'_> {
+    fn drop(&mut self) {
+        // Clear borrowed device pointers even when backward returns an error.
+        unsafe {
+            ffi::bulletou_bind_ft_saturation_guard(
+                self.ctx.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0.0,
+                0.0,
+                1,
+            );
+        }
+    }
+}
+
+impl Binding<'_> {
+    pub(super) fn finish(
+        self,
+        r: &mut SfnnTrainStepRunner,
+        p: SfnnLayerLrMultipliers,
+        slot: Option<usize>,
+    ) -> Result<()> {
+        if self.reference {
+            apply(r, self.ctx, p, slot)?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn prepare<'a>(
+    r: &mut SfnnTrainStepRunner,
+    ctx: &'a Context,
+    p: SfnnLayerLrMultipliers,
+    slot: Option<usize>,
+) -> Result<Binding<'a>> {
+    // The opt-in audit deliberately retains the separate reference pass so it
+    // can measure before/after gradients. Normal training always uses fusion.
+    let reference = std::env::var("BULLETOU_FT_GUARD_AUDIT").as_deref() == Ok("1");
+    let binding = Binding { ctx, reference };
+    check(unsafe {
+        ffi::bulletou_bind_ft_saturation_guard(
+            ctx.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0.0,
+            0.0,
+            1,
+        )
+    })?;
+    if p.ft_saturation_penalty == 0.0 || p.l0 == 0.0 {
+        r.ft_saturation_guard = None;
+        return Ok(binding);
+    }
+    if reference {
+        return Ok(binding);
+    }
+    p.validate()?;
+    let config = (p.ft_saturation_penalty, p.ft_saturation_rate, p.ft_saturation_patience);
+    if r.ft_saturation_guard.as_ref().is_none_or(|s| s.config != config) {
+        r.ft_saturation_guard = Some(State {
+            counts: I32Buffer::new(ctx, r.shape.ft_size + 1)?,
+            streaks: I32Buffer::from_host(ctx, &vec![0; r.shape.ft_size])?,
+            config,
+            audit_step: 0,
+        });
+    }
+    let state = r.ft_saturation_guard.as_ref().unwrap();
+    let weights = match slot {
+        Some(i) => &r.upload_slots[i].entry_weights,
+        None => &r.entry_weights,
+    };
+    check(unsafe {
+        ffi::bulletou_bind_ft_saturation_guard(
+            ctx.as_ptr(),
+            weights.as_ptr(),
+            state.counts.as_ptr(),
+            state.streaks.as_ptr(),
+            r.batch_size,
+            r.shape.ft_size,
+            p.ft_saturation_penalty,
+            p.ft_saturation_rate,
+            p.ft_saturation_patience as i32,
+        )
+    })?;
+    Ok(binding)
+}
+
 pub(super) fn apply(
     r: &mut SfnnTrainStepRunner,
     ctx: &Context,

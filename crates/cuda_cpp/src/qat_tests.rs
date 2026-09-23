@@ -14,6 +14,57 @@ fn batch() -> SfnnTrainStepHostBatch<'static> {
 
 #[test]
 #[ignore = "requires CUDA; tiny synthetic model"]
+fn ft_guard_fused_matches_separate_pass_with_accumulation() {
+    let ctx=Context::new(0).unwrap();
+    let upload=Context::new(0).unwrap();
+    for factorized in [false,true] {
+        for path in 0..3 {
+            let mut host=tiny_sfnn_weights(tiny_sfnn_shape());
+            host.l2fw=None;host.l2fb=None;host.l3fw=None;host.l3fb=None;
+            if factorized {host.shape.input_size=133578;}
+            let mut w=vec![0.0;host.shape.input_size*host.shape.ft_size];
+            w[..16].copy_from_slice(host.l0w);
+            if factorized {w[131949*4..131953*4].fill(0.02);}
+            host.l0w=&w;host.l0b=&[-0.2,0.35,0.85,1.3];
+            let mut fused=SfnnTrainStepRunner::new(&ctx,host,4,3).unwrap();
+            let mut reference=SfnnTrainStepRunner::new(&ctx,host,4,3).unwrap();
+            fused.factorizer_alpha.ft=0.5;reference.factorizer_alpha.ft=0.5;
+            let policy=SfnnLayerLrMultipliers{ft_saturation_penalty:0.37,ft_saturation_rate:0.2,
+                ft_saturation_patience:2,qat_l1:true,l1_center:true,l2_l3_center:true,..Default::default()};
+            let off=SfnnLayerLrMultipliers{ft_saturation_penalty:0.0,..policy};
+            let p=RangerUpdateParams::default();
+            let run=|r:&mut SfnnTrainStepRunner,policy| {
+                match path {
+                    0=>r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,p,
+                        ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(),true,false,policy).unwrap(),
+                    1=>r.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,&upload,p,
+                        ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(),true,false,policy).unwrap(),
+                    _=>{r.step_profiled_no_readback_with_update_and_lr_multipliers(&ctx,p,
+                        ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch(),false,policy).unwrap();},
+                }
+            };
+            for micro in 0..4 {
+                run(&mut fused,policy);
+                // Run ordinary backward then the old separate penalty, retaining
+                // its streak across microbatches without a process-wide env flag.
+                let history=reference.ft_saturation_guard.take();
+                run(&mut reference,off);
+                reference.ft_saturation_guard=history;
+                let slot=if path==1{Some((reference.next_upload_slot+reference.upload_slots.len()-1)%reference.upload_slots.len())}else{None};
+                ft_saturation_guard::apply(&mut reference,&ctx,policy,slot).unwrap();
+                for (a,b) in [(&fused.backward_workspace.l0w_gradients,&reference.backward_workspace.l0w_gradients),
+                    (&fused.backward_workspace.l0b_gradients,&reference.backward_workspace.l0b_gradients)] {
+                    for (i,(x,y)) in a.download(&ctx).unwrap().iter().zip(b.download(&ctx).unwrap()).enumerate() {
+                        assert!((x-y).abs()<2e-6,"factorized={factorized} path={path} micro={micro} index={i} fused={x} reference={y}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA; tiny synthetic model"]
 fn ft_guard_runner_paths_accumulation_center_qat_and_restore() {
     let ctx=Context::new(0).unwrap();
     let upload=Context::new(0).unwrap();
