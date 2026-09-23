@@ -192,7 +192,9 @@ SFNNのGPU量子化後検証では、qacc/qlossと同じforwardの中間値を�
 
 上限到達率は、検証した全局面で使用した要素のうち活性化上限1に到達した要素の割合です。重み自体のclipping率ではありません。CSVでは0〜1の割合（0.08456なら8.456%）、stdoutの `[qstats] mode=gpu` 行では百分率で表示します。最終batchが小さい場合も局面数・要素数で加重して集計します。
 
-さらにGPU qvalidでは `[qstats-unit]` 行に、unit別上限到達率の**最大値**を表示します。
+`[qstats]` / `[qstats-unit]` のコンソール表示は `--verbose`（JSON: `"verbose": true`）を指定したときだけ有効です。`grid_search.py`にも `--verbose` を指定できます。省略時も計測と既存のCSV記録は続けます。
+
+詳細表示時には、さらにGPU qvalidの `[qstats-unit]` 行に、unit別上限到達率の**最大値**を表示します。
 `ft_unit_upper_max`、`l1_unit_upper_max`、`l1_square_unit_upper_max`、`l2_unit_upper_max` が対象です。
 FTは両視点を合わせた全検証局面（母数 `2 × 局面数`）、L1/L2は各bucketを使用した局面を母数にしてunitごとの率を求め、その最大を選びます。L1のskip出力は対象外です。
 batchごとの最大値ではなく、検証全体の回数を合算してから計算します。

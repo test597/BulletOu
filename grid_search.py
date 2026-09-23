@@ -111,6 +111,7 @@ def parse_args(argv=None):
     p.add_argument("--dry-run", action="store_true", help="Validate and display the plan without writing files or training")
     p.add_argument("--resume", action="store_true", help="Resume selected existing grid conditions; increase --epochs to extend their total epoch budget")
     p.add_argument("--continue-on-error", action="store_true")
+    p.add_argument("--verbose", action="store_true", help="Pass --verbose to BulletOu to display qstats/qstats-unit; CSV measurements are unchanged")
     a = p.parse_args(argv)
     if a.epochs is not None and (not a.epochs or min(a.epochs) < 1):
         p.error("--epochs must contain positive integers")
@@ -739,11 +740,13 @@ def run_child(command: list[str], directory: Path, cwd: str, trial_id: int) -> t
     return code, time.monotonic() - start
 
 
-def command_for(plan: dict, directory: Path, resume: bool) -> list[str]:
+def command_for(plan: dict, directory: Path, resume: bool, verbose: bool = False) -> list[str]:
     filename = "bulletou-resume-settings.json" if resume else "bulletou-run-settings.json"
     command = [plan["exe"], "--settings-file", str(directory / filename)]
     if resume:
         command.append("--resume")
+    if verbose:
+        command.append("--verbose")
     return command
 
 
@@ -863,7 +866,7 @@ def main(argv=None) -> int:
                 atomic_json(directory / "bulletou-resume-settings.json", resume_settings(trial["settings"]))
             else:
                 atomic_json(directory / "bulletou-run-settings.json", trial["settings"])
-            command = command_for(plan, directory, resume)
+            command = command_for(plan, directory, resume, args.verbose)
             record_settings_launch(directory, trial, resume)
             old_elapsed = state.get("elapsed_seconds", 0)
             atomic_json(state_path, {"status": "running", "elapsed_seconds": old_elapsed})

@@ -4451,6 +4451,10 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
     after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  export-nn16                Export FP32 SFNN state.bin with int16 L1/L2/L3 weights (default QB=4096)\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  progress-train             Train a shared 0..255 SFNN progress classifier from complete .pack games\n  export-progress-bin        Extract SFNN progress parameters from state.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
+    /// Print per-validation qstats/qstats-unit diagnostics. Measurement and CSV
+    /// recording are unchanged when this display-only option is disabled.
+    #[arg(long)]
+    verbose: bool,
     #[arg(long, hide = true)]
     epoch_settings_json: Option<String>,
     /// Read BulletOu training options from a JSON file. Keys use snake_case
@@ -19197,9 +19201,11 @@ impl CudaCppSfnnResidentValidationCache {
             (totals[4] / n).sqrt() * 8128.0,
         ];
         self.quantized_diagnostics = Some(diagnostics);
-        eprintln!("  [qstats] mode=gpu ft_upper={:.4}% l1_upper={:.4}% l1_square_upper={:.4}% l2_upper={:.4}% output_raw_rms={:.3}",
-            diagnostics[0]*100.0, diagnostics[1]*100.0, diagnostics[2]*100.0, diagnostics[3]*100.0, diagnostics[4]);
-        eprintln!("  [qstats-unit] mode=gpu {}", unit_stats.summary());
+        if args.verbose {
+            eprintln!("  [qstats] mode=gpu ft_upper={:.4}% l1_upper={:.4}% l1_square_upper={:.4}% l2_upper={:.4}% output_raw_rms={:.3}",
+                diagnostics[0]*100.0, diagnostics[1]*100.0, diagnostics[2]*100.0, diagnostics[3]*100.0, diagnostics[4]);
+            eprintln!("  [qstats-unit] mode=gpu {}", unit_stats.summary());
+        }
         Ok(run_one_test_pass(self.cache.as_ref(), args, &self.outputs))
     }
 }
@@ -34034,6 +34040,17 @@ mod tests {
         enabled.nnue_pytorch_init_scale=0.5; enabled.sfnn_init_l2_scale=Some(2.0); enabled.sfnn_init_l3_scale=Some(0.5);
         let (b2,b3)=sfnn_l2_l3_weight_init_bounds(&enabled);
         assert_eq!(b2,bound2); assert_eq!(b3,bound3*0.25);
+    }
+
+    #[test]
+    fn verbose_cli_json_is_display_only_and_resume_compatible() {
+        let mut argv: Vec<std::ffi::OsString> = ["bulletou", "--arch", "SFNN_halfka2_1024_8_64_progress8", "--teacher", "/dev/null"].map(Into::into).to_vec();
+        let base=Args::try_parse_from(argv.clone()).unwrap();
+        assert!(!base.verbose);
+        bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),"verbose",&serde_json::json!(true),&mut argv).unwrap();
+        let enabled=Args::try_parse_from(argv).unwrap();
+        assert!(enabled.verbose);
+        assert_eq!(resume_signature(&base),resume_signature(&enabled));
     }
 
     #[test]

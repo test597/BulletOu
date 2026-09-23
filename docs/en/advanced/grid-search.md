@@ -1,5 +1,11 @@
 # Compare training conditions with grid search
 
+## Verbose saturation diagnostics
+
+Training hides `[qstats]` / `[qstats-unit]` console lines by default. Use `python .\grid_search.py ... --verbose` to pass `--verbose` to BulletOu. Direct training also accepts `--verbose`, or `"verbose": true` in its settings JSON.
+
+This only changes display: diagnostics computation, existing CSV fields, and acc/loss/qacc/qloss output are unchanged. The grid-level flag does not change trial identity and can be toggled on resume. A common JSON setting of `verbose: true` also enables detailed output.
+
 ## Initial LR warmup
 
 Warmup is an independent **epoch 0**, unrestricted by `superbatches`. For example, `warmup_sb: 1024, superbatches: 64, max_epochs: 1` runs 1024 warmup SB plus 64 regular SB (1088 total), not just a one-SB prefix.

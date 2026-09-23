@@ -15,6 +15,16 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_verbose_is_forwarded_without_changing_trial_identity(self):
+        normal = self.plan([])
+        verbose = self.plan(["--verbose"])
+        self.assertEqual(normal, verbose)
+        for resume in (False, True):
+            command = grid.command_for(normal, self.output, resume, True)
+            self.assertEqual(command.count("--verbose"), 1)
+            self.assertEqual("--resume" in command, resume)
+            self.assertNotIn("--verbose", grid.command_for(normal, self.output, resume))
+
     def test_l1_center_grid_and_epoch_booleans(self):
         plan = self.plan(["--grid", "sfnn-l1-center", "false", "true"])
         self.assertEqual({t["settings"]["sfnn_l1_center"] for t in plan["trials"]}, {False, True})

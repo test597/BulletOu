@@ -192,7 +192,9 @@ SFNN GPU quantized validation automatically aggregates the existing qacc/qloss f
 
 Upper ratios count activation elements reaching the upper bound of 1, not clipped weights. They cover the elements actually used by all validation positions. CSV ratios are 0–1 (0.08456 means 8.456%); stdout `[qstats] mode=gpu` displays percentages. Aggregation weights batches by their actual element counts, including a short final batch.
 
-GPU qvalid also prints `[qstats-unit]`: **maximum per-unit upper saturation rates** for
+The `[qstats]` / `[qstats-unit]` console lines require `--verbose` (JSON: `"verbose": true`). `grid_search.py` also accepts `--verbose`. Without it, measurement and existing CSV recording continue unchanged.
+
+With verbose output, GPU qvalid also prints `[qstats-unit]`: **maximum per-unit upper saturation rates** for
 `ft_unit_upper_max`, `l1_unit_upper_max`, `l1_square_unit_upper_max`, and `l2_unit_upper_max`.
 FT combines both perspectives (denominator `2 × positions`). L1/L2 use each bucket's
 position count as denominator. L1's linear skip output is excluded. Counts are summed

@@ -1,5 +1,11 @@
 # Grid searchで学習条件を比較する
 
+## 飽和率の詳細表示
+
+通常は学習中の `[qstats]` / `[qstats-unit]` をコンソールに表示しません。表示したいときは `python .\grid_search.py ... --verbose` を指定してください。子プロセスのBulletOuに `--verbose` を渡します。本体を直接起動するときも `--verbose`、学習JSONでは `"verbose": true` を指定できます。
+
+表示の有無だけを変更し、飽和率の計測・既存CSV列への記録、acc/loss/qacc/qlossの表示は変えません。gridの `--verbose` は実験条件・trial識別には含めず、resume時にも変更できます。共通JSON側で `verbose: true` とした場合も詳細を表示します。
+
 ## 学習開始時のLR warmup
 
 warmupは独立した**epoch 0**です。`warmup_sb`は`superbatches`より大きくても構いません。例えば`warmup_sb: 1024, superbatches: 64, max_epochs: 1`はwarmupを1024sb、通常学習を64sb、合計1088sb実行します。最初の1sbだけで打ち切る指定ではありません。
