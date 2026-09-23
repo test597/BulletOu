@@ -9149,6 +9149,7 @@ mod ffi {
             rows: usize, cols: usize) -> i32;
         pub fn bulletou_center_scale(ctx:*mut BulletOuCudaCppContext,src:*mut BulletOuCudaCppF32Buffer,
             dst:*mut BulletOuCudaCppF32Buffer,n:usize,scale:f32)->i32;
+        #[cfg(test)]
         pub fn bulletou_center_affine_layout(ctx:*mut BulletOuCudaCppContext,
             w:*mut BulletOuCudaCppF32Buffer,b:*mut BulletOuCudaCppF32Buffer,
             sw:*mut BulletOuCudaCppF32Buffer,sb:*mut BulletOuCudaCppF32Buffer,
