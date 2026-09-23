@@ -27,11 +27,17 @@ Reported loss/qloss exclude this penalty. It is separate from the existing `sfnn
 Append to an existing grid command:
 
 ```powershell
-  --grid sfnn-ft-saturation-penalty 0 0.0001 0.001
+  --grid sfnn-ft-saturation-penalty 0 0.001 0.01 0.1 1.0
 ```
 
 These are starting points, not validated optimal strengths. Keep initialization, learning rate and training budget identical. Use `--verbose` to compare mean and maximum per-unit saturation as well as accuracy and playing strength.
 
+The gradient is averaged over FT width as well. With F=1024 and strength=0.001, even a fully saturated unit receives at most about 0.000000977 additional bias gradient when entry weights are one. If small strengths have little effect, test a logarithmically wider range as above; 1.0 is not a recommended optimum.
+
 Supported: cuda-cpp SFNN, update scope=all, FT factorization, QAT, L1/L2/L3 centering, effective L1 clipping and bpu>1. Frozen FT skips the penalty. Detection stays on GPU without readback. History requires about 8KiB for F=1024, but activation scanning and gradient application add training cost. OFF performs no extra scans or allocations.
 
 History is transient: resume, worker snapshot restoration, configuration changes and disabling reset it. Checkpoints and nn.bin formats and inference are unchanged. Existing running jobs/settings are not modified; start or resume with the rebuilt executable to use the option.
+
+The gradient kernel accesses adjacent units contiguously and aggregates by input feature before updating weight gradients. It reuses the ordinary backward inverse-index scratch, growing it if necessary, without an extra full FT activation array. This optimization does not change the formula, threshold or strength semantics. Parallel accumulation order changes, so floating-point results are not bitwise identical.
+
+Developer diagnostics: `BULLETOU_FT_GUARD_AUDIT=1` logs gradients, momentum and CUDA timing at microbatches 1/10/100/610/1220 after history initialization/reset. This mode introduces large CPU readbacks and synchronization; leave it unset for normal training. Pre-clamp reconstruction is a HalfKA2 diagnostic using the first 4096 positions.

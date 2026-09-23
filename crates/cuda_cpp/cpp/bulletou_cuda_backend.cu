@@ -5856,19 +5856,14 @@ int ensure_sfnn_inverse_index_scratch(
     return 0;
 }
 
-int launch_sfnn_inverse_index_for_perspective(
+int launch_sfnn_build_inverse_index(
     BulletOuCudaCppContext* ctx,
     const int* indices,
-    const float* pre_gradients,
-    float* l0w_gradients,
     size_t batch,
     size_t max_active,
-    size_t n_features,
-    size_t ft_size,
-    int add_to_existing) {
+    size_t n_features) {
     constexpr int count_threads = 256;
     constexpr int scan_threads = 1024;
-    constexpr int gather_threads = 128;
     const size_t total_entries = batch * max_active;
     const size_t prefix_blocks = (n_features + scan_threads - 1) / scan_threads;
     if (ensure_sfnn_inverse_index_scratch(ctx, n_features, total_entries, prefix_blocks) != 0) {
@@ -5934,6 +5929,18 @@ int launch_sfnn_inverse_index_for_perspective(
     if (check_kernel_launch("sfnn_inverse_scatter_positions_kernel launch") != 0) {
         return -1;
     }
+
+    return 0;
+}
+
+int launch_sfnn_inverse_index_for_perspective(
+    BulletOuCudaCppContext* ctx, const int* indices,
+    const float* pre_gradients, float* l0w_gradients,
+    size_t batch, size_t max_active, size_t n_features,
+    size_t ft_size, int add_to_existing) {
+    if (launch_sfnn_build_inverse_index(ctx, indices, batch, max_active, n_features) != 0)
+        return -1;
+    constexpr int gather_threads = 128;
 
     dim3 gather_grid(
         static_cast<unsigned int>(n_features),
@@ -11115,34 +11122,47 @@ __global__ void ft_guard_streak(const int* counts,int* streaks,size_t ft,float r
     else streaks[u]=0;
 }
 
-__global__ void ft_guard_gradient(const float* a,const float* b,const float* weights,
-    const int* ai,const int* bi,const int* streaks,float* gw,float* gb,
-    size_t batch,size_t ft,size_t active,size_t inputs,float ft_alpha,float strength,int patience) {
-    const size_t u=blockIdx.y;
-    if(streaks[u]<patience) return;
-    const size_t i=blockIdx.x*blockDim.x+threadIdx.x;
+__global__ void ft_guard_bias_gradient(const float* a,const float* b,const float* weights,
+    const int* streaks,float* gb,size_t batch,size_t ft,float strength,int patience) {
+    // Contiguous FT reads; one reduced bias atomic per unit and row block.
+    const unsigned x=threadIdx.x,y=threadIdx.y;
+    const size_t u=blockIdx.x*32+x;
+    const bool enabled=u<ft && streaks[u]>=patience;
     float g=0.0f;
-    if(i<batch && weights[i]>0.0f) {
+    for(size_t i=blockIdx.y*8+y;i<batch;i+=gridDim.y*8) {
+        if(!enabled || !(weights[i]>0.0f)) continue;
         const float delta=strength*weights[i]/(2.0f*float(batch)*float(ft));
         for(int view=0;view<2;++view) {
             if((view?b:a)[i*ft+u]<1.0f) continue;
             g+=delta;
-            const int* indices=(view?bi:ai)+i*active;
-            for(size_t j=0;j<active;++j) {
-                const int feature=indices[j];
-                if(feature>=0 && size_t(feature)<inputs)
-                    sfnn_atomic_add_l0w_gradient(gw,size_t(feature),inputs,ft,u,delta,ft_alpha);
-            }
         }
     }
     __shared__ float sums[256];
-    sums[threadIdx.x]=g;
+    sums[y*32+x]=g;
     __syncthreads();
-    for(unsigned s=128;s;s>>=1) {
-        if(threadIdx.x<s) sums[threadIdx.x]+=sums[threadIdx.x+s];
-        __syncthreads();
+    if(y==0 && enabled) {
+        float sum=0.0f;
+        for(unsigned j=0;j<8;++j) sum+=sums[j*32+x];
+        if(sum!=0.0f) atomicAdd(gb+u,sum);
     }
-    if(threadIdx.x==0 && sums[0]!=0.0f) atomicAdd(gb+u,sums[0]);
+}
+
+__global__ void ft_guard_gather_gradient(const float* activation,const float* weights,
+    const int* positions,const int* offsets,const int* streaks,float* gw,
+    size_t batch,size_t ft,size_t inputs,float ft_alpha,float strength,int patience) {
+    const size_t feature=blockIdx.x;
+    const size_t u=blockIdx.y*blockDim.x+threadIdx.x;
+    if(u>=ft || streaks[u]<patience) return;
+    const int begin=offsets[feature],end=offsets[feature+1];
+    float sum=0.0f;
+    for(int j=begin;j<end;++j) {
+        const size_t i=positions[j];
+        if(weights[i]>0.0f && !(activation[i*ft+u]<1.0f))
+            sum+=strength*weights[i]/(2.0f*float(batch)*float(ft));
+    }
+    // Aggregate before writing. At most one base and one virtual-feature
+    // atomic per feature/unit, rather than per saturated position/feature/unit.
+    if(sum!=0.0f) sfnn_atomic_add_l0w_gradient(gw,feature,inputs,ft,u,sum,ft_alpha);
 }
 
 extern "C" int bulletou_ft_saturation_guard(BulletOuCudaCppContext* ctx,
@@ -11166,9 +11186,19 @@ extern "C" int bulletou_ft_saturation_guard(BulletOuCudaCppContext* ctx,
     if(check_kernel_launch("FT saturation count")) return -1;
     ft_guard_streak<<<(ft+255)/256,256,0,ctx->stream>>>(counts->ptr,streaks->ptr,ft,rate,patience);
     if(check_kernel_launch("FT saturation streak")) return -1;
-    ft_guard_gradient<<<dim3((batch+255)/256,ft),256,0,ctx->stream>>>(a->ptr,b->ptr,weights->ptr,
-        ai->ptr,bi->ptr,streaks->ptr,gw->ptr,gb->ptr,batch,ft,active,inputs,ft_alpha,strength,patience);
-    return check_kernel_launch("FT saturation gradient");
+    const unsigned row_blocks=static_cast<unsigned>(std::min(size_t(256),(batch+7)/8));
+    ft_guard_bias_gradient<<<dim3((ft+31)/32,row_blocks),dim3(32,8),0,ctx->stream>>>(
+        a->ptr,b->ptr,weights->ptr,streaks->ptr,gb->ptr,batch,ft,strength,patience);
+    if(check_kernel_launch("FT saturation bias gradient")) return -1;
+    for(int view=0;view<2;++view) {
+        // Reuse the ordinary backward scratch: no full activation/gradient copy.
+        if(launch_sfnn_build_inverse_index(ctx,(view?bi:ai)->ptr,batch,active,inputs)) return -1;
+        ft_guard_gather_gradient<<<dim3(inputs,(ft+127)/128),128,0,ctx->stream>>>(
+            (view?b:a)->ptr,weights->ptr,ctx->sfnn_inverse_positions,ctx->sfnn_inverse_offsets,
+            streaks->ptr,gw->ptr,batch,ft,inputs,ft_alpha,strength,patience);
+        if(check_kernel_launch("FT saturation gathered gradient")) return -1;
+    }
+    return 0;
 }
 
 __global__ void clip_effective_l1_kernel(float* w,float* slow,const float* shared,const float* shared_slow,
