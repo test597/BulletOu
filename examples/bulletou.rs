@@ -4072,7 +4072,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
-    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1", "sfnn_l2_l3_center",
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
@@ -4091,7 +4091,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if epoch.is_none() || name != &format!("epoch{}", epoch.unwrap()) {
             return Err(format!("invalid epoch key `{name}` in `{key}`; use epoch1, epoch2, ..."));
         }
-        let boolean = matches!(key, "sfnn_qat_l1" | "sfnn_freeze_l1" | "sfnn_l2_l3_center");
+        let boolean = matches!(key, "sfnn_qat_l1" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
         }
@@ -4121,7 +4121,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center,
+        assign!(lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
@@ -5186,6 +5186,11 @@ struct Args {
     #[arg(long)]
     sfnn_l2_l3_center: bool,
 
+    /// Center dense L1 optimizer inputs on GPU (default off); independent of L2/L3 centering.
+    /// Supports none/shared and accumulated batches; disables weight clipping with a warning.
+    #[arg(long)]
+    sfnn_l1_center: bool,
+
     /// Quantized i8 threshold used by `--sfnn-saturation-penalty`, in QB
     /// units. 127 means only weights that would hit the i8 edge are
     /// penalized; lower values start damping earlier.
@@ -5311,28 +5316,31 @@ impl Args {
         if self.sfnn_init_l2_l3_glorot && (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()) {
             return Err("--sfnn-init-l2-l3-glorot requires --backend cuda-cpp and an SFNN arch".into());
         }
-        if self.sfnn_l2_l3_center {
+        if self.sfnn_l2_l3_center || self.sfnn_l1_center {
             if self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack() {
-                return Err("--sfnn-l2-l3-center requires --backend cuda-cpp and an SFNN arch".into());
+                return Err("SFNN centering requires --backend cuda-cpp and an SFNN arch".into());
             }
             if self.sfnn_update_scope != SfnnUpdateScopeArg::All {
-                return Err("--sfnn-l2-l3-center requires --sfnn-update-scope all".into());
+                return Err("SFNN centering requires --sfnn-update-scope all".into());
             }
             if self.optimizer_weight_clip != Some(0.0) {
                 static WARNING: std::sync::Once = std::sync::Once::new();
-                WARNING.call_once(|| eprintln!("  WARN: --sfnn-l2-l3-center disables optimizer weight clipping; configured/default bounds are ignored while centering is enabled (effective optimizer_weight_clip=0)."));
+                WARNING.call_once(|| eprintln!("  WARN: SFNN centering disables optimizer weight clipping; configured/default bounds are ignored while centering is enabled (effective optimizer_weight_clip=0)."));
             }
             if self.optimizer_weight_decay != 0.0
                 || self.sfnn_norm_loss_strength != 0.0 || self.sfnn_saturation_penalty != 0.0
                 || self.sfnn_factorizer_residual_decay != 0.0 {
-                return Err("--sfnn-l2-l3-center requires --optimizer-weight-decay 0, --sfnn-norm-loss-strength 0, --sfnn-saturation-penalty 0 and --sfnn-factorizer-residual-decay 0".into());
+                return Err("SFNN centering requires --optimizer-weight-decay 0, --sfnn-norm-loss-strength 0, --sfnn-saturation-penalty 0 and --sfnn-factorizer-residual-decay 0".into());
             }
             let spec = effective_sfnn_factorizer_spec(self);
             if spec != SfnnFactorizerSpec::NONE && spec != SfnnFactorizerSpec::SHARED {
-                return Err("--sfnn-l2-l3-center currently supports --sfnn-factorizer none/shared only".into());
+                return Err("SFNN centering currently supports --sfnn-factorizer none/shared only".into());
             }
             if self.sfnn_bucket_counts.is_some() {
-                return Err("--sfnn-l2-l3-center currently does not support --sfnn-bucket-counts".into());
+                return Err("SFNN centering currently does not support --sfnn-bucket-counts".into());
+            }
+            if self.sfnn_l1_center && (self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some()) {
+                return Err("--sfnn-l1-center requires dense L1 (no compact/grouped L1)".into());
             }
         }
         if self.warmup_sb > 0 {
@@ -5984,7 +5992,7 @@ fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
         eprintln!(
             "  optimizer weight clip        = tatara: L1/L2 weights+biases, L3 weights +/-1.984375; FT and L3 bias off (individual tensors, after RAdam)"
         );
-    } else if args.sfnn_l2_l3_center || args.optimizer_weight_clip.unwrap_or(0.0) == 0.0 {
+    } else if args.sfnn_l2_l3_center || args.sfnn_l1_center || args.optimizer_weight_clip.unwrap_or(0.0) == 0.0 {
         eprintln!("  optimizer weight clip        = off");
     } else {
         eprintln!(
@@ -6089,7 +6097,7 @@ fn quantized_loss_label(args: &QuantizedTestArgs) -> String {
 const STATE_BACKEND_CUDA_CPP: &str = "cuda-cpp";
 
 fn uses_tatara_weight_clip(args: &Args) -> bool {
-    !args.sfnn_l2_l3_center && args.optimizer_weight_clip.is_none()
+    !args.sfnn_l2_l3_center && !args.sfnn_l1_center && args.optimizer_weight_clip.is_none()
         && matches!(
             args.resolved_eval_type(),
             Some(EvalType::SfnnKa2 | EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2)
@@ -6097,7 +6105,7 @@ fn uses_tatara_weight_clip(args: &Args) -> bool {
 }
 
 fn optimizer_weight_clip_signature(args: &Args) -> String {
-    if args.sfnn_l2_l3_center { return "0.000000000".into(); }
+    if args.sfnn_l2_l3_center || args.sfnn_l1_center { return "0.000000000".into(); }
     if uses_tatara_weight_clip(args) {
         "tatara".to_string()
     } else {
@@ -6108,7 +6116,7 @@ fn optimizer_weight_clip_signature(args: &Args) -> String {
 fn ranger_params(args: &Args) -> optimiser::RangerParams {
     // The CUDA backend recognizes the full finite range as clipping disabled.
     // SFNN's default per-layer bounds are applied when dispatching each tensor.
-    let clip = if args.sfnn_l2_l3_center { f32::MAX } else {
+    let clip = if args.sfnn_l2_l3_center || args.sfnn_l1_center { f32::MAX } else {
         args.optimizer_weight_clip.filter(|clip| *clip > 0.0).unwrap_or(f32::MAX)
     };
     let mut params = optimiser::RangerParams {
@@ -24581,6 +24589,9 @@ fn cuda_cpp_should_profile_sfnn_diagnostics(args: &Args, progress: Option<CudaCp
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn print_sfnn_qat_mode(args: &Args) {
+    print_startup_kv("L1 centering", if args.sfnn_l1_center {
+        "on: GPU accumulated-batch global input mean; residual/shared optimizer coordinates; folded forward/export"
+    } else { "off" });
     print_startup_kv("L2/L3 centering", if args.sfnn_l2_l3_center {
         "on: GPU accumulated-batch input means, centered optimizer coordinates; folded forward/export; weight clipping disabled"
     } else { "off" });
@@ -24601,6 +24612,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
 ) -> bulletou_cuda_cpp::SfnnLayerLrMultipliers {
     let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers {
         l2_l3_center: args.sfnn_l2_l3_center,
+        l1_center: args.sfnn_l1_center,
         norm_loss_strength: args.sfnn_norm_loss_strength,
         l1: args.sfnn_l1_lr_mult,
         update_scope: args.sfnn_update_scope.into(),
@@ -25315,6 +25327,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_qat_l1={}", args.sfnn_qat_l1),
         format!("sfnn_l2_l3_center={}", args.sfnn_l2_l3_center),
+        format!("sfnn_l1_center={}", args.sfnn_l1_center),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
@@ -25566,6 +25579,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
     // Centering can be explicitly changed on resume; tensors remain folded.
     let signature = resume_signature_without_line(&signature, "sfnn_l2_l3_center=");
+    let signature = resume_signature_without_line(&signature, "sfnn_l1_center=");
     let signature = resume_signature_without_line(&signature, "test_batch_size=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_rate=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_exact=");
@@ -34020,6 +34034,34 @@ mod tests {
         enabled.nnue_pytorch_init_scale=0.5; enabled.sfnn_init_l2_scale=Some(2.0); enabled.sfnn_init_l3_scale=Some(0.5);
         let (b2,b3)=sfnn_l2_l3_weight_init_bounds(&enabled);
         assert_eq!(b2,bound2); assert_eq!(b3,bound3*0.25);
+    }
+
+    #[test]
+    fn l1_center_cli_json_epoch_and_constraints() {
+        let mut argv: Vec<std::ffi::OsString> = ["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfka2_1024_8_64_progress8", "--sfnn-factorizer", "shared",
+            "--superbatches", "1", "--max-epochs", "1"].map(Into::into).to_vec();
+        let base=Args::try_parse_from(argv.clone()).unwrap();
+        assert!(!base.sfnn_l1_center);
+        bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),"sfnn_l1_center",&serde_json::json!(true),&mut argv).unwrap();
+        let mut enabled=Args::try_parse_from(argv).unwrap();
+        assert!(enabled.sfnn_l1_center);
+        assert!(enabled.validate_arch_flags().is_ok());
+        assert!(cuda_cpp_sfnn_layer_lr_multipliers(&enabled,None).l1_center);
+        assert!(!uses_tatara_weight_clip(&enabled));
+        assert_eq!(ranger_params(&enabled).max_weight,f32::MAX);
+        enabled.sfnn_l2_l3_center=true;
+        enabled.batches_per_update=4;
+        assert!(enabled.validate_arch_flags().is_ok());
+        enabled.sfnn_norm_loss_strength=0.001;
+        assert!(enabled.validate_arch_flags().is_err());
+        let mut scheduled=base;
+        scheduled.epoch_settings_json=Some(serde_json::json!({
+            "sfnn_l1_center":{"epoch1":false,"epoch2":true,"epoch3":false}
+        }).to_string());
+        assert!(!args_at_epoch(&scheduled,1).unwrap().sfnn_l1_center);
+        assert!(args_at_epoch(&scheduled,2).unwrap().sfnn_l1_center);
+        assert!(!args_at_epoch(&scheduled,3).unwrap().sfnn_l1_center);
     }
 
     #[test]

@@ -1,5 +1,25 @@
 # L2/L3 optimizer centering
 
+## A/B testing L1 centering
+
+`--sfnn-l1-center` (JSON: `"sfnn_l1_center": true`, default OFF) applies the same optimizer-coordinate transformation to L1. It is independent of, and can be combined with, L2/L3 centering.
+
+```powershell
+python .\grid_search.py `
+  --settings-file <common-settings.json> `
+  --output-folder <new-comparison-folder> `
+  --grid sfnn-l2-l3-center true `
+  --grid sfnn-l1-center false true
+```
+
+The GPU computes a global mean of the combined FT features feeding L1 across all batches in an update. The same mean applies to bucket-specific and shared L1 weights; it is not a per-bucket mean. BPU>1 and L1 QAT are supported. Dense L1 and factorizer none/shared are required; other restrictions below also apply. This does not center FT itself, normalize outputs, or penalize saturation. A reduction in saturation is not guaranteed.
+
+Additional L1 scratch is approximately 132 KiB at FT width 1024, with no whole-weight CPU transfers. Forward and nn.bin retain the folded form. Epoch schedules and toggling on resume are supported without resetting optimizer state.
+
+GPU mean reduction parallelizes rows as well as columns. L1 residual/shared coordinate transforms share one kernel launch before and after the optimizer update. All positions contribute to the mean; there is no subsampling. Reduction ordering can introduce floating-point roundoff differences, but centering equations, learning rates and optimizer definitions are unchanged.
+
+The centering path avoids redundant mean accumulation, zeroing and copies for BPU=1; for BPU>1, final mean scaling uses a single kernel per layer. Benchmark your workload to determine the actual speedup. Set `optimizer_weight_clip: 0` for both A/B conditions to avoid also changing the clipping policy.
+
 `--sfnn-l2-l3-center` (JSON: `"sfnn_l2_l3_center": true`) enables input-mean-centered optimizer coordinates for L2/L3. It is **off by default** and does not center FT/L1.
 
 ## Settings

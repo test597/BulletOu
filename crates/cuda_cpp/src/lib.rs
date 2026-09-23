@@ -6105,6 +6105,8 @@ pub struct SfnnTrainStepRunner {
     experimental_output_centers: Option<(F32Buffer, F32Buffer)>,
     output_center_sums: Option<(F32Buffer, F32Buffer)>,
     output_center_batches: usize,
+    l1_center_buffers: Option<(F32Buffer, F32Buffer)>,
+    l1_center_batches: usize,
     output_center_bucketwise: bool,
     pending_gradient_batches: usize,
     pub shape: SfnnForwardShape,
@@ -6191,6 +6193,8 @@ impl SfnnUpdateScope {
 pub struct SfnnLayerLrMultipliers {
     /// Input-centered optimizer coordinates for L2/L3 over all accumulated batches.
     pub l2_l3_center: bool,
+    /// Input-centered optimizer coordinates for dense L1 residual/shared weights.
+    pub l1_center: bool,
     pub norm_loss_strength: f32,
     pub l0: f32,
     pub l1: f32,
@@ -6211,6 +6215,7 @@ impl Default for SfnnLayerLrMultipliers {
     fn default() -> Self {
         Self {
             l2_l3_center: false,
+            l1_center: false,
             norm_loss_strength: 0.0,
             l0: 1.0,
             l1: 1.0,
@@ -6438,6 +6443,8 @@ impl SfnnTrainStepRunner {
             factorizer_alpha,
             output_center_sums: None,
             output_center_batches: 0,
+            l1_center_buffers: None,
+            l1_center_batches: 0,
             output_center_bucketwise: std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref()==Ok("1"),
             pending_gradient_batches: 0,
             experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu")
@@ -6996,6 +7003,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
+        self.l1_center_batches = 0;
         self.output_center_batches = 0;
         self.pending_gradient_batches = 0;
         self.forward_workspace.invalidate_l1_qat();
@@ -7017,6 +7025,7 @@ impl SfnnTrainStepRunner {
         factorizer: SfnnFactorizerActive,
         factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<()> {
+        self.l1_center_batches = 0;
         self.output_center_batches = 0;
         self.pending_gradient_batches = 0;
         self.forward_workspace.invalidate_l1_qat();
@@ -7193,6 +7202,7 @@ impl SfnnTrainStepRunner {
             &self.entry_weights,
         )?;
         experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
+        l1_center::accumulate(self, ctx, lr_multipliers.l1_center)?;
         self.pending_gradient_batches += 1;
         if update_weights {
             self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
@@ -7366,6 +7376,7 @@ impl SfnnTrainStepRunner {
             )?;
         }
         experimental_output_center::accumulate_from_slot(self, ctx, lr_multipliers.l2_l3_center, Some(slot_idx))?;
+        l1_center::accumulate(self, ctx, lr_multipliers.l1_center)?;
         self.pending_gradient_batches += 1;
         if update_weights {
             self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
@@ -7501,6 +7512,7 @@ impl SfnnTrainStepRunner {
         )?;
         after_backward.record(ctx)?;
         experimental_output_center::accumulate(self, ctx, lr_multipliers.l2_l3_center)?;
+        l1_center::accumulate(self, ctx, lr_multipliers.l1_center)?;
         self.pending_gradient_batches += 1;
         if update_weights {
             self.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr_multipliers, dirty_buckets)?;
@@ -8076,11 +8088,13 @@ impl SfnnTrainStepRunner {
         let l2_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L2)?;
         let l3_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L3)?;
         let experiment_projection = experimental_l1_project::capture(self, ctx)?;
+        l1_center::prepare(self, ctx, params, lr_multipliers)?;
         let experiment_output_center = experimental_output_center::capture(self, ctx, params, lr_multipliers)?;
         if let Some(c) = &experiment_output_center {
             experimental_output_center::transform(self, ctx, c, true)?;
         }
         let experiment_center = experimental_l1_center::center(self, ctx)?;
+        if lr_multipliers.l1_center { l1_center::transform(self, ctx, true)?; }
         if let Some(c) = &experiment_center {
             if lr_multipliers.tatara_weight_clip || params.radam.decay != 0.0 || lr_multipliers.norm_loss_strength != 0.0
                 || lr_multipliers.factorizer_residual_decay != 0.0 || lr_multipliers.saturation_penalty != 0.0
@@ -8174,6 +8188,7 @@ impl SfnnTrainStepRunner {
         if let Some(c) = &experiment_center {
             experimental_l1_center::transform(self, ctx, c, false)?;
         }
+        if lr_multipliers.l1_center { l1_center::transform(self, ctx, false)?; }
         if let Some(s) = &experiment_projection {
             experimental_l1_project::apply(self, ctx, s)?;
         }
@@ -8313,6 +8328,7 @@ impl SfnnTrainStepRunner {
             experimental_output_center::transform(self, ctx, c, false)?;
         }
         self.output_center_batches = 0;
+        self.l1_center_batches = 0;
         self.pending_gradient_batches = 0;
         Ok(())
     }
@@ -9070,6 +9086,7 @@ fn check(code: i32) -> Result<()> {
 }
 
 mod experimental_l1_center;
+mod l1_center;
 mod experimental_recycle;
 mod experimental_l1_project;
 mod experimental_output_center;
@@ -9126,6 +9143,23 @@ mod ffi {
         pub fn bulletou_experiment_column_mean(ctx: *mut BulletOuCudaCppContext,
             input: *mut BulletOuCudaCppF32Buffer, scratch: *mut BulletOuCudaCppF32Buffer,
             rows: usize, cols: usize) -> i32;
+        #[cfg(test)]
+        pub fn bulletou_center_mean_reference(ctx: *mut BulletOuCudaCppContext,
+            input: *mut BulletOuCudaCppF32Buffer, scratch: *mut BulletOuCudaCppF32Buffer,
+            rows: usize, cols: usize) -> i32;
+        pub fn bulletou_center_scale(ctx:*mut BulletOuCudaCppContext,src:*mut BulletOuCudaCppF32Buffer,
+            dst:*mut BulletOuCudaCppF32Buffer,n:usize,scale:f32)->i32;
+        pub fn bulletou_center_affine_layout(ctx:*mut BulletOuCudaCppContext,
+            w:*mut BulletOuCudaCppF32Buffer,b:*mut BulletOuCudaCppF32Buffer,
+            sw:*mut BulletOuCudaCppF32Buffer,sb:*mut BulletOuCudaCppF32Buffer,
+            gw:*mut BulletOuCudaCppF32Buffer,gb:*mut BulletOuCudaCppF32Buffer,
+            c:*mut BulletOuCudaCppF32Buffer,rows:usize,cols:usize,before:i32,column_major:i32)->i32;
+        pub fn bulletou_center_l1_groups(ctx:*mut BulletOuCudaCppContext,
+            w:*mut BulletOuCudaCppF32Buffer,b:*mut BulletOuCudaCppF32Buffer,sw:*mut BulletOuCudaCppF32Buffer,sb:*mut BulletOuCudaCppF32Buffer,
+            gw:*mut BulletOuCudaCppF32Buffer,gb:*mut BulletOuCudaCppF32Buffer,
+            fw:*mut BulletOuCudaCppF32Buffer,fb:*mut BulletOuCudaCppF32Buffer,fsw:*mut BulletOuCudaCppF32Buffer,fsb:*mut BulletOuCudaCppF32Buffer,
+            fgw:*mut BulletOuCudaCppF32Buffer,fgb:*mut BulletOuCudaCppF32Buffer,
+            c:*mut BulletOuCudaCppF32Buffer,cols:usize,before:i32)->i32;
         pub fn bulletou_experiment_bucket_mean(ctx:*mut BulletOuCudaCppContext,input:*mut BulletOuCudaCppF32Buffer,buckets:*mut BulletOuCudaCppI32Buffer,scratch:*mut BulletOuCudaCppF32Buffer,n:usize,d:usize,stacks:usize)->i32;
         pub fn bulletou_experiment_bucket_centers(ctx:*mut BulletOuCudaCppContext,sums:*mut BulletOuCudaCppF32Buffer,centers:*mut BulletOuCudaCppF32Buffer,d:usize,stacks:usize)->i32;
         pub fn bulletou_experiment_center_affine_bucket(ctx:*mut BulletOuCudaCppContext,w:*mut BulletOuCudaCppF32Buffer,b:*mut BulletOuCudaCppF32Buffer,sw:*mut BulletOuCudaCppF32Buffer,sb:*mut BulletOuCudaCppF32Buffer,gw:*mut BulletOuCudaCppF32Buffer,gb:*mut BulletOuCudaCppF32Buffer,c:*mut BulletOuCudaCppF32Buffer,rows:usize,cols:usize,group_rows:usize,before:i32)->i32;

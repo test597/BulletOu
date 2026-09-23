@@ -1,5 +1,25 @@
 # L2/L3の中心化
 
+## L1中心化のA/Bテスト
+
+`--sfnn-l1-center`（JSON: `"sfnn_l1_center": true`、デフォルトOFF）で、L1にも同じoptimizer座標の中心化を適用できます。L2/L3中心化とは独立しており、併用も可能です。
+
+```powershell
+python .\grid_search.py `
+  --settings-file <共通設定.json> `
+  --output-folder <新しい比較フォルダ> `
+  --grid sfnn-l2-l3-center true `
+  --grid sfnn-l1-center false true
+```
+
+L1に入力されるFT結合特徴の平均をGPU上で求め、bucket個別重みとshared重みに適用します。bucket別平均ではなく、更新対象の全バッチにわたる共通平均です。BPU>1、L1 QATに対応します。dense L1・factorizer none/sharedに限定し、その他の併用条件は下記と同じです。FT自身の中心化・出力の正規化・飽和率への罰則ではありません。飽和率低下は保証されないため、A/Bで確認してください。
+
+L1の追加GPU作業領域はFT幅1024で約132 KiBです。重み全体のCPU転送はしません。forwardとnn.binは従来のfold済み形式です。epoch指定によるON/OFFとresume時の切替も可能ですが、optimizer状態はリセットしません。
+
+GPU平均計算は列方向だけでなく行方向も並列化します。L1のbucket個別・sharedの座標変換は1カーネルにまとめ、更新前後それぞれの起動回数を削減しています。平均を取る局面の間引きはしません。加算順序の変更による浮動小数点の微差はありますが、中心化の式・学習率・optimizerの定義は変えていません。
+
+中心化処理では、BPU=1の不要な平均値の加算・ゼロ初期化・コピーを省き、BPU>1でも平均の確定を1カーネルにまとめています。速度改善量は環境と構成によるため、実測で比較してください。A/Bでは両条件とも `optimizer_weight_clip: 0` にして、clipの有無まで変わらないようにしてください。
+
 `--sfnn-l2-l3-center`（JSON: `"sfnn_l2_l3_center": true`）は、L2/L3のoptimizer更新を入力平均で中心化した座標で行う比較実験用オプションです。デフォルトは無効です。FT/L1を中心化する機能ではありません。
 
 ## 指定方法

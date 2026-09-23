@@ -56,6 +56,24 @@ __global__ void experiment_mean_finish(float* scratch, size_t rows, size_t cols)
     scratch[col] = sum / static_cast<float>(rows);
 }
 
+// Keep 32 partials, but parallelize rows within each CTA as well as columns.
+// Adjacent lanes read adjacent columns. More CTAs/independent accumulators
+// avoid the long single-thread dependency chain of the reference reduction.
+__global__ void center_mean_tiled(const float* x,float* scratch,size_t rows,size_t cols) {
+    __shared__ float sums[8][32];
+    const size_t col=blockIdx.x*32+threadIdx.x;
+    float sum=0.0f;
+    if(col<cols) for(size_t row=blockIdx.y+32*threadIdx.y;row<rows;row+=256)
+        sum+=x[row*cols+col];
+    sums[threadIdx.y][threadIdx.x]=sum;
+    __syncthreads();
+    if(threadIdx.y==0 && col<cols) {
+        float total=0.0f;
+        for(int y=0;y<8;++y) total+=sums[y][threadIdx.x];
+        scratch[blockIdx.y*cols+col]=total;
+    }
+}
+
 namespace {
 
 thread_local std::string g_last_error;
@@ -11058,16 +11076,16 @@ extern "C" int bulletou_cuda_cpp_rebase_shared_device(
     return check_kernel_launch("shared rebase scale");
 }
 
-__global__ void experiment_center_affine_kernel(float* w, float* b, float* sw, float* sb,
-    float* gw, const float* gb, const float* c, size_t cols, bool before, size_t group_rows, size_t center_stride) {
+__device__ void center_affine_row(float* w,float* b,float* sw,float* sb,float* gw,
+    const float* gb,const float* c,size_t row,size_t rows,size_t cols,bool before,bool column_major) {
     __shared__ float fast[256];
     __shared__ float slow[256];
-    const size_t row=blockIdx.x, j=threadIdx.x, i=row*cols+j;
-    c += (row/group_rows)*center_stride;
+    const size_t j=threadIdx.x;
     float f=0.0f,s=0.0f;
-    if(j<cols) {
-        f=w[i]*c[j]; s=sw[i]*c[j];
-        if(before) gw[i]-=gb[row]*c[j];
+    for(size_t col=j;col<cols;col+=blockDim.x) {
+        const size_t i=column_major?col*rows+row:row*cols+col;
+        f+=w[i]*c[col]; s+=sw[i]*c[col];
+        if(before) gw[i]-=gb[row]*c[col];
     }
     fast[j]=f; slow[j]=s; __syncthreads();
     for(unsigned step=128;step;step>>=1) {
@@ -11075,6 +11093,43 @@ __global__ void experiment_center_affine_kernel(float* w, float* b, float* sw, f
         __syncthreads();
     }
     if(j==0) {const float sign=before?1.0f:-1.0f;b[row]+=sign*fast[0];sb[row]+=sign*slow[0];}
+}
+
+__global__ void experiment_center_affine_kernel(float* w,float* b,float* sw,float* sb,
+    float* gw,const float* gb,const float* c,size_t cols,bool before,size_t group_rows,size_t center_stride,bool column_major=false) {
+    center_affine_row(w,b,sw,sb,gw,gb,c+(blockIdx.x/group_rows)*center_stride,
+        blockIdx.x,gridDim.x,cols,before,column_major);
+}
+
+struct CenterAffineGroup { float *w,*b,*sw,*sb,*gw,*gb; size_t rows; };
+__global__ void center_l1_groups(CenterAffineGroup a,CenterAffineGroup b,const float* c,size_t cols,bool before) {
+    const bool shared=blockIdx.x>=a.rows;
+    const auto g=shared?b:a;
+    const size_t row=shared?blockIdx.x-a.rows:blockIdx.x;
+    center_affine_row(g.w,g.b,g.sw,g.sb,g.gw,g.gb,c,row,g.rows,cols,before,shared);
+}
+
+extern "C" int bulletou_center_l1_groups(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w,BulletOuCudaCppF32Buffer* b,BulletOuCudaCppF32Buffer* sw,BulletOuCudaCppF32Buffer* sb,
+    BulletOuCudaCppF32Buffer* gw,BulletOuCudaCppF32Buffer* gb,
+    BulletOuCudaCppF32Buffer* fw,BulletOuCudaCppF32Buffer* fb,BulletOuCudaCppF32Buffer* fsw,BulletOuCudaCppF32Buffer* fsb,
+    BulletOuCudaCppF32Buffer* fgw,BulletOuCudaCppF32Buffer* fgb,
+    BulletOuCudaCppF32Buffer* c,size_t cols,int before) {
+    if(!cols || cols>65536 || !b || !b->len || b->len>65536 || validate_buffer(ctx,c,cols,"l1 center")!=0) return -1;
+    auto validate=[&](BulletOuCudaCppF32Buffer* w,BulletOuCudaCppF32Buffer* b,BulletOuCudaCppF32Buffer* sw,
+        BulletOuCudaCppF32Buffer* sb,BulletOuCudaCppF32Buffer* gw,BulletOuCudaCppF32Buffer* gb,CenterAffineGroup& out) {
+        if(!b || !b->len || b->len>65536 || b->len>SIZE_MAX/cols) return false;
+        const size_t rows=b->len;
+        if(validate_buffer(ctx,w,rows*cols,"l1 w") || validate_buffer(ctx,b,rows,"l1 b") ||
+           validate_buffer(ctx,sw,rows*cols,"l1 slow w") || validate_buffer(ctx,sb,rows,"l1 slow b") ||
+           validate_buffer(ctx,gw,rows*cols,"l1 gw") || validate_buffer(ctx,gb,rows,"l1 gb"))return false;
+        out={w->ptr,b->ptr,sw->ptr,sb->ptr,gw->ptr,gb->ptr,rows};return true;
+    };
+    CenterAffineGroup a{},f{};
+    if(!validate(w,b,sw,sb,gw,gb,a))return -1;
+    if(fw && !validate(fw,fb,fsw,fsb,fgw,fgb,f))return -1;
+    center_l1_groups<<<static_cast<unsigned>(a.rows+f.rows),256,0,ctx->stream>>>(a,f,c->ptr,cols,before!=0);
+    return check_kernel_launch("fused L1 residual/shared centering");
 }
 
 extern "C" int bulletou_experiment_center_affine(BulletOuCudaCppContext* ctx,
@@ -11092,15 +11147,54 @@ extern "C" int bulletou_experiment_center_affine(BulletOuCudaCppContext* ctx,
     return check_kernel_launch("experimental output centering");
 }
 
+extern "C" int bulletou_center_affine_layout(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w, BulletOuCudaCppF32Buffer* b,
+    BulletOuCudaCppF32Buffer* sw, BulletOuCudaCppF32Buffer* sb,
+    BulletOuCudaCppF32Buffer* gw, BulletOuCudaCppF32Buffer* gb,
+    BulletOuCudaCppF32Buffer* c, size_t rows, size_t cols, int before, int column_major) {
+    if(rows==0 || cols==0 || cols>65536 || rows>65536 || rows>SIZE_MAX/cols ||
+       validate_buffer(ctx,w,rows*cols,"center w")!=0 || validate_buffer(ctx,b,rows,"center b")!=0 ||
+       validate_buffer(ctx,sw,rows*cols,"center slow w")!=0 || validate_buffer(ctx,sb,rows,"center slow b")!=0 ||
+       validate_buffer(ctx,gw,rows*cols,"center gw")!=0 || validate_buffer(ctx,gb,rows,"center gb")!=0 ||
+       validate_buffer(ctx,c,cols,"center c")!=0) return -1;
+    experiment_center_affine_kernel<<<static_cast<unsigned>(rows),256,0,ctx->stream>>>(
+        w->ptr,b->ptr,sw->ptr,sb->ptr,gw->ptr,gb->ptr,c->ptr,cols,before!=0,rows,cols,column_major!=0);
+    return check_kernel_launch("L1 centered optimizer coordinates");
+}
+
+__global__ void center_scale_kernel(const float* src,float* dst,size_t n,float scale) {
+    const size_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) dst[i]=src[i]*scale;
+}
+extern "C" int bulletou_center_scale(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* src,BulletOuCudaCppF32Buffer* dst,size_t n,float scale) {
+    if(n==0 || !std::isfinite(scale) || validate_buffer(ctx,src,n,"center src")!=0 ||
+       validate_buffer(ctx,dst,n,"center dst")!=0) return -1;
+    center_scale_kernel<<<(n+255)/256,256,0,ctx->stream>>>(src->ptr,dst->ptr,n,scale);
+    return check_kernel_launch("center scale/copy");
+}
+
 extern "C" int bulletou_experiment_column_mean(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* input, BulletOuCudaCppF32Buffer* scratch, size_t rows, size_t cols) {
     if (rows == 0 || cols == 0 || cols > 65536 || rows > SIZE_MAX / cols ||
         validate_buffer(ctx,input,rows*cols,"centering input") != 0 ||
         validate_buffer(ctx,scratch,32*cols,"centering scratch") != 0) return -1;
-    experiment_mean_partial<<<dim3((cols+255)/256,32),256,0,ctx->stream>>>(input->ptr,scratch->ptr,rows,cols);
+    center_mean_tiled<<<dim3((cols+31)/32,32),dim3(32,8),0,ctx->stream>>>(input->ptr,scratch->ptr,rows,cols);
     if (check_kernel_launch("centering partial") != 0) return -1;
     experiment_mean_finish<<<(cols+255)/256,256,0,ctx->stream>>>(scratch->ptr,rows,cols);
     return check_kernel_launch("centering finish");
+}
+
+// Retained for numerical/performance regression tests, not a training switch.
+extern "C" int bulletou_center_mean_reference(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* input,BulletOuCudaCppF32Buffer* scratch,size_t rows,size_t cols) {
+    if(!rows || !cols || cols>65536 || rows>SIZE_MAX/cols ||
+       validate_buffer(ctx,input,rows*cols,"reference input")!=0 ||
+       validate_buffer(ctx,scratch,32*cols,"reference scratch")!=0) return -1;
+    experiment_mean_partial<<<dim3((cols+255)/256,32),256,0,ctx->stream>>>(input->ptr,scratch->ptr,rows,cols);
+    if(check_kernel_launch("reference partial")!=0)return -1;
+    experiment_mean_finish<<<(cols+255)/256,256,0,ctx->stream>>>(scratch->ptr,rows,cols);
+    return check_kernel_launch("reference finish");
 }
 
 __global__ void bucket_center_partial(const float* x,const int* buckets,float* scratch,size_t n,size_t d,size_t stacks) {

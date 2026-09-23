@@ -35,7 +35,7 @@ pub(super) fn group(ctx: &Context, w: &F32Buffer, b: &F32Buffer, ws: &RangerPara
     group_layout(ctx,w,b,ws,bs,gw,gb,cols,c,before,false)
 }
 
-fn group_layout(ctx: &Context, w: &F32Buffer, b: &F32Buffer, ws: &RangerParamState,
+pub(super) fn group_layout(ctx: &Context, w: &F32Buffer, b: &F32Buffer, ws: &RangerParamState,
     bs: &RangerParamState, gw: &F32Buffer, gb: &F32Buffer, cols: usize, c: &[f32], before: bool,
     column_major: bool) -> Result<()> {
     let weights = w.download(ctx)?;

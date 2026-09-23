@@ -15,6 +15,16 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_l1_center_grid_and_epoch_booleans(self):
+        plan = self.plan(["--grid", "sfnn-l1-center", "false", "true"])
+        self.assertEqual({t["settings"]["sfnn_l1_center"] for t in plan["trials"]}, {False, True})
+        for key in ("sfnn_l1_center", "sfnn_l2_l3_center"):
+            values = {key: {"epoch1": False, "epoch2": True}}
+            self.assertFalse(grid.resolve_epoch_settings(values, 1)[key])
+            self.assertTrue(grid.resolve_epoch_settings(values, 2)[key])
+            with self.assertRaises(ValueError):
+                grid.resolve_epoch_settings({key: {"epoch1": 1}}, 1)
+
     def test_trial_warning_color_is_console_only(self):
         line = "  WARN: clipping disabled\n"
         with patch.dict(os.environ, {"BULLETOU_COLOR": "always"}, clear=True):
