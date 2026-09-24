@@ -32,6 +32,7 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=cpp/bulletou_cuda_backend.cu");
+    println!("cargo:rerun-if-changed=cpp/batch_norm.cuh");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");

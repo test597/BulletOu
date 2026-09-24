@@ -1,0 +1,92 @@
+# SFNNのBatch Normalization（実験用）
+
+FT・L1・L2の線形出力に、activation前のBatchNorm（BN）を個別に追加できます。
+デフォルトはすべてOFFです。中心化とは別の処理で、学習中のforwardも変わります。
+
+## オプション
+
+JSONでは `_`、CLIでは `-` を使います。grid searchではどちらも使えます。
+
+| JSONキー | デフォルト | 意味 |
+|---|---:|---|
+| `sfnn_bn_ft` | `false` | FT加算後、clamp・前半後半の積より前にBN |
+| `sfnn_bn_l1` | `false` | L1線形出力をBNしてから通常枝・二乗枝へ分岐。skip出力は対象外 |
+| `sfnn_bn_l2` | `false` | L2線形出力をBNしてからclamp |
+| `sfnn_bn_gamma` | `0.25` | 有効なBN各層のγの**初期値**。γはその後学習される |
+| `sfnn_bn_beta` | `0.5` | 有効なBN各層のβの**初期値**。βはその後学習される |
+| `sfnn_bn_momentum` | `0.1` | 推論用統計のEMAで、**新しいbatch側**に掛ける係数。範囲 `(0,1]` |
+| `sfnn_bn_epsilon` | `0.00001` | 分散の分母へ足す正の定数 |
+
+γ=0.25、β=0.5は、標準偏差1のまま上限1のclampへ入れることを避けるための実験用初期値です。
+最適値が確認されたわけではありません。標準的なγ=1、β=0も指定できます。
+これらのオプションはepoch別切り替えには対応していません。
+
+## 計算と統計の単位
+
+\[
+ y=\gamma\frac{z-\mu_B}{\sqrt{v_B+\varepsilon}}+\beta
+\]
+
+FTは両視点を合わせ、同じunitの統計・γ・βを共有します。
+L1/L2はbucket・unitごとです。学習batchの全レコードを統計に使用し、lossのentry weightでは重み付けしません。
+学習時の分散は母分散、推論用の移動分散には不偏分散を使います。
+初めて2件以上出現したgroupは、そのbatchで推論用統計を初期化し、以降EMAで更新します。
+0件なら統計は変更せず、1件なら推論用統計を使い統計は更新しません。
+未初期化の統計は平均0・分散1です。
+
+BNのbackwardは平均・分散の微分を含みます。STEではありません。
+γ・βは本体と同じRanger更新タイミング・学習率で学習しますが、weight decayとweight clipの対象にはしません。
+`batches_per_update`が2以上の場合、各mini-batchでBNを計算し、γ・βの勾配も本体と同様に蓄積します。
+蓄積した全batchを一括してBNする方式ではありません。
+
+## 推論・保存・resume
+
+validationは推論用の移動平均・分散を使用します。qvalidとnn.binは、その同じ統計を次の式でfoldしてから量子化します。
+
+\[
+r=\frac{\gamma}{\sqrt{v_{\rm running}+\varepsilon}},\quad
+W'=rW,\quad b'=r(b-\mu_{\rm running})+\beta
+\]
+
+L1のshared成分も合算してからbucketごとにfoldします。nn.binの形式や、やねうら王の推論処理を変更する必要はありません。
+fold後の重みが量子化範囲に収まる保証はないため、acc/qacc・飽和率も確認してください。
+
+`state.bin`にはfold前の重みとBNのγ・β、移動統計、γ・βのoptimizer stateを保存します。
+BN付きcheckpointのresumeには同じBN設定が必要です。保存されたBNを無視してOFFで読み込むことはエラーにします。
+BNなしのcheckpointに新たにBNを追加すると、forwardが変わります。単なる等価変換ではありません。
+
+## 対応範囲と負荷
+
+- cuda-cppの通常学習と`grid_search.py`。dense SFNN、factorizer `none` / `shared`。
+- 現時点ではworker、plateau、compact/grouped L1、bucket-count gates、層のfreeze／個別LR倍率は未対応。
+- QAT、`sfnn_l1_effective_weight_clip`、FT/weight saturation penaltyは併用不可。暗黙に無効化せずエラーで知らせます。
+- L1／L2・L3の中心化とは併用できます（中心化側の制約も適用）。
+- 各BN層は `bucket数 × unit数 <= 65536`。FTは1group。
+- validationのbatch sizeは学習batch size以下にしてください。
+- `average-sfnn-state`と`compare-sfnn-quantization`はBN付きstate.bin未対応です。BNを無視した結果を返さずエラーにします。学習中のvalidation/qvalidとnn.bin出力は対応しています。
+
+BNは追加のGPU集計とbackwardが必要です。FT幅1024・batch65536の場合、両視点の正規化済み値だけで約512 MiBのVRAMが追加されます。
+現実装のBN有効時qvalidはCPU readback・fold・再upload経路を使うため、BNなしのGPU直接変換より遅くなります。
+BN OFFならこの追加領域・経路は使いません。高速化や棋力改善は未保証です。
+
+## Grid searchの例
+
+新しい出力フォルダで、FT/L1を独立にON/OFFする4条件です。
+既存設定にQAT等があれば、比較全条件で明示的にOFFにします。
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260923-progress8-bceloss.json `
+  --output-folder D:\BulletOu-snapshots\20260925\grid-progress8-bn `
+  --grid sfnn-bn-ft false true `
+  --grid sfnn-bn-l1 false true `
+  --grid sfnn-bn-l2 false `
+  --grid sfnn-qat-l1 false `
+  --grid sfnn-l1-effective-weight-clip false `
+  --grid sfnn-ft-saturation-penalty 0 `
+  --grid sfnn-saturation-penalty 0
+```
+
+L2も比較するなら `--grid sfnn-bn-l2 false true` に変更すると8条件になります。
+BN以外の学習条件は共通JSONから引き継ぎます。BNの各条件は`grid_summary.csv`にも出力されます。
+新しいBN機能を使用する前にBulletOuを再ビルドしてください。学習中の実行ファイルは置き換えないでください。

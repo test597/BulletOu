@@ -1,5 +1,9 @@
 # Grid searchで学習条件を比較する
 
+FT・L1・L2のBNは `--grid sfnn-bn-ft false true`、`--grid sfnn-bn-l1 false true`、
+`--grid sfnn-bn-l2 false true` で比較できます。全指定で8条件です。
+初期値・併用制限・保存仕様は [Batch Normalization](batch-normalization.md) を参照してください。
+
 ## 飽和率の詳細表示
 
 通常は学習中の `[qstats]` / `[qstats-unit]` をコンソールに表示しません。表示したいときは `python .\grid_search.py ... --verbose` を指定してください。子プロセスのBulletOuに `--verbose` を渡します。本体を直接起動するときも `--verbose`、学習JSONでは `"verbose": true` を指定できます。

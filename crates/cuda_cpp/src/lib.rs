@@ -1,5 +1,7 @@
 use std::{error, ffi::CStr, fmt, os::raw::c_char, ptr::NonNull};
 
+pub mod batch_norm;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CudaCppError {
     message: String,
@@ -5981,6 +5983,7 @@ impl<'a> SfnnTrainStepHostBatch<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SfnnTrainWeightsReadback {
+    pub batch_norm: batch_norm::NetworkState,
     pub l0w: Vec<f32>,
     pub l0b: Vec<f32>,
     pub l1w: Vec<f32>,
@@ -6102,6 +6105,7 @@ impl SfnnTrainStepUploadSlot {
 
 #[derive(Debug)]
 pub struct SfnnTrainStepRunner {
+    pub batch_norm: Option<batch_norm::Network>,
     experimental_output_centers: Option<(F32Buffer, F32Buffer)>,
     output_center_sums: Option<(F32Buffer, F32Buffer)>,
     output_center_batches: usize,
@@ -6136,6 +6140,7 @@ pub struct SfnnTrainStepRunner {
 
 #[derive(Debug)]
 pub struct SfnnTrainStepRunnerSnapshot {
+    pub batch_norm: batch_norm::NetworkState,
     pub weights: SfnnForwardDeviceWeights,
     pub optimizer_states: SfnnRangerOptimizerStates,
     pub factorizer: SfnnFactorizerActive,
@@ -6464,6 +6469,7 @@ impl SfnnTrainStepRunner {
             l1_center_buffers: None,
             l1_center_batches: 0,
             ft_saturation_guard: None,
+            batch_norm: None,
             output_center_bucketwise: std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref()==Ok("1"),
             pending_gradient_batches: 0,
             experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu")
@@ -7014,6 +7020,7 @@ impl SfnnTrainStepRunner {
     pub fn snapshot_device(&self, ctx: &Context) -> Result<SfnnTrainStepRunnerSnapshot> {
         self.validate()?;
         Ok(SfnnTrainStepRunnerSnapshot {
+            batch_norm: self.read_batch_norm_state(ctx)?,
             weights: self.weights.try_clone_device(ctx)?,
             optimizer_states: self.optimizer_states.try_clone_device(ctx, self.shape)?,
             factorizer: self.factorizer,
@@ -7022,6 +7029,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
+        self.restore_batch_norm(ctx,&src.batch_norm)?;
         self.ft_saturation_guard = None;
         self.l1_center_batches = 0;
         self.output_center_batches = 0;
@@ -7045,6 +7053,9 @@ impl SfnnTrainStepRunner {
         factorizer: SfnnFactorizerActive,
         factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<()> {
+        if self.batch_norm.is_some() {
+            return Err(CudaCppError::message("host-only runner restore cannot restore BN state; use the complete device snapshot restore"));
+        }
         self.ft_saturation_guard = None;
         self.l1_center_batches = 0;
         self.output_center_batches = 0;
@@ -7172,6 +7183,7 @@ impl SfnnTrainStepRunner {
         self.validate()?;
         lr_multipliers.validate()?;
         self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
+        let _bn = self.bind_training_bn(ctx,lr_multipliers)?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -7341,6 +7353,7 @@ impl SfnnTrainStepRunner {
         self.validate()?;
         lr_multipliers.validate()?;
         self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
+        let _bn = self.bind_training_bn(ctx,lr_multipliers)?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -7476,6 +7489,7 @@ impl SfnnTrainStepRunner {
         self.validate()?;
         lr_multipliers.validate()?;
         self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
+        let _bn = self.bind_training_bn(ctx,lr_multipliers)?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -7568,6 +7582,7 @@ impl SfnnTrainStepRunner {
         batch: &SfnnForwardDeviceBatch,
         workspace: &SfnnForwardWorkspace,
     ) -> Result<()> {
+        let _bn = self.batch_norm.as_ref().map(|b|b.bind(ctx,batch.batch_size,false)).transpose()?;
         self.weights.validate()?;
         self.factorizer.validate_for_shape(self.shape)?;
         self.factorizer_alpha.validate()?;
@@ -7587,6 +7602,7 @@ impl SfnnTrainStepRunner {
 
     pub fn read_weights(&self, ctx: &Context) -> Result<SfnnTrainWeightsReadback> {
         Ok(SfnnTrainWeightsReadback {
+            batch_norm: self.read_batch_norm_state(ctx)?,
             l0w: self.weights.l0w.download(ctx)?,
             l0b: self.weights.l0b.download(ctx)?,
             l1w: self.weights.l1w.download(ctx)?,
@@ -8362,8 +8378,39 @@ impl SfnnTrainStepRunner {
         if lr_multipliers.l1_effective_weight_clip && lr_multipliers.l1 > 0.0 {
             l1_center::clip_effective_weights(self, ctx)?;
         }
+        if let Some(bn)=&self.batch_norm {bn.update(ctx,params)?;}
         self.pending_gradient_batches = 0;
         Ok(())
+    }
+}
+
+impl SfnnTrainStepRunner {
+    pub fn configure_batch_norm(&mut self,ctx:&Context,enabled:[bool;3],config:batch_norm::Config,saved:&batch_norm::NetworkState)->Result<()> {
+        if enabled.iter().any(|x|*x) {
+            if self.shape.has_compact_l1() || self.factorizer.any_axis() || self.residual_count_gates_enabled {
+                return Err(CudaCppError::message("BN currently requires dense L1, none/shared factorizer and no residual count gates"));
+            }
+            self.batch_norm=Some(batch_norm::Network::new(ctx,self.shape,self.batch_size,enabled,config,saved)?);
+        } else {
+            if saved.0.iter().any(Option::is_some) {return Err(CudaCppError::message("checkpoint contains BN; enable the saved BN layers to resume"));}
+            self.batch_norm=None;
+        } Ok(())
+    }
+    pub fn read_batch_norm_state(&self,ctx:&Context)->Result<batch_norm::NetworkState> {
+        self.batch_norm.as_ref().map(|b|b.read_state(ctx)).transpose().map(|s|s.unwrap_or_default())
+    }
+    pub fn restore_batch_norm(&mut self,ctx:&Context,s:&batch_norm::NetworkState)->Result<()> {
+        let enabled=std::array::from_fn(|i|s.0[i].is_some());
+        let config=s.0.iter().flatten().next().map(|x|x.config).unwrap_or_default();
+        self.configure_batch_norm(ctx,enabled,config,s)
+    }
+    fn bind_training_bn<'a>(&self,ctx:&'a Context,lr:SfnnLayerLrMultipliers)->Result<Option<batch_norm::Binding<'a>>> {
+        if self.batch_norm.is_some() && (lr.qat_l1 || lr.ft_saturation_penalty>0.0 || lr.saturation_penalty>0.0 ||
+            lr.l1_effective_weight_clip || lr.update_scope!=SfnnUpdateScope::All
+            || lr.l0!=1.0 || lr.l1!=1.0 || lr.l2!=1.0 || lr.l3!=1.0) {
+            return Err(CudaCppError::message("BN does not yet support QAT, saturation penalties, L1 effective clipping or layer freezing/LR multipliers"));
+        }
+        self.batch_norm.as_ref().map(|b|b.bind(ctx,self.batch_size,true)).transpose()
     }
 }
 

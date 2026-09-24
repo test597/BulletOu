@@ -288,6 +288,17 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual({(r["sfnn_init_l2_l3_glorot"],r["sfnn_l2_l3_center"]) for r in rows},
                          {(False,False),(False,True),(True,False),(True,True)})
 
+    def test_batch_norm_axes_and_summary(self):
+        plan=self.plan(["--grid","sfnn-bn-ft","false","true",
+                        "--grid","sfnn-bn-l1","false","true",
+                        "--grid","sfnn-bn-l2","false","true",
+                        "--grid","sfnn-bn-gamma","0.25"])
+        self.assertEqual(len(plan["trials"]),16)  # fixture also varies lr over two values
+        fields,rows=grid.summarize(self.output,plan)
+        for key in ("sfnn_bn_ft","sfnn_bn_l1","sfnn_bn_l2","sfnn_bn_gamma"):
+            self.assertEqual(fields.count(key),1)
+        self.assertEqual(len({(r["sfnn_bn_ft"],r["sfnn_bn_l1"],r["sfnn_bn_l2"]) for r in rows}),8)
+
     def complete_plan(self, plan):
         for trial in plan["trials"]:
             directory = grid.trial_dir(self.output, trial)

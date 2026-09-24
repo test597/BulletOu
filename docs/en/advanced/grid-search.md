@@ -1,5 +1,7 @@
 # Compare training conditions with grid search
 
+For independent FT/L1/L2 BatchNorm switches, defaults, limitations and grid examples, see [Batch normalization](batch-normalization.md).
+
 ## Verbose saturation diagnostics
 
 Training hides `[qstats]` / `[qstats-unit]` console lines by default. Use `python .\grid_search.py ... --verbose` to pass `--verbose` to BulletOu. Direct training also accepts `--verbose`, or `"verbose": true` in its settings JSON.

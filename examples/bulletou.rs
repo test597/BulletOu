@@ -5197,6 +5197,24 @@ struct Args {
     #[arg(long)]
     sfnn_l1_center: bool,
 
+    /// BatchNorm before FT clamp/product (both perspectives share statistics).
+    #[arg(long)]
+    sfnn_bn_ft: bool,
+    /// Bucket-wise BatchNorm before L1 normal/squared activations (not skip).
+    #[arg(long)]
+    sfnn_bn_l1: bool,
+    /// Bucket-wise BatchNorm before L2 clamp.
+    #[arg(long)]
+    sfnn_bn_l2: bool,
+    #[arg(long, default_value_t = 0.25)]
+    sfnn_bn_gamma: f32,
+    #[arg(long, default_value_t = 0.5)]
+    sfnn_bn_beta: f32,
+    #[arg(long, default_value_t = 0.1)]
+    sfnn_bn_momentum: f32,
+    #[arg(long, default_value_t = 1e-5)]
+    sfnn_bn_epsilon: f32,
+
     /// Clip folded L1 weights (residual + alpha*shared) to [-2,127/64] after updates.
     /// Default off. Projects fast and Lookahead slow weights; preserves biases/moments.
     #[arg(long)]
@@ -5380,6 +5398,29 @@ impl Args {
             }
             if self.sfnn_l1_center && (self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some()) {
                 return Err("--sfnn-l1-center requires dense L1 (no compact/grouped L1)".into());
+            }
+        }
+        if self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2 {
+            let spec=effective_sfnn_factorizer_spec(self);
+            if self.backend!=BackendKind::CudaCpp || !self.eval_type().uses_layerstack()
+                || self.arch().sfnn_l1_group_count()!=1 || self.arch().sfnn_l1_common_size.is_some()
+                || (spec!=SfnnFactorizerSpec::NONE && spec!=SfnnFactorizerSpec::SHARED) || self.sfnn_bucket_counts.is_some() {
+                return Err("SFNN BN requires cuda-cpp, dense SFNN, factorizer none/shared and no bucket counts".into());
+            }
+            if self.sfnn_qat_l1 || self.sfnn_l1_effective_weight_clip || self.sfnn_ft_saturation_penalty!=0.0
+                || self.sfnn_saturation_penalty!=0.0 || self.sfnn_update_scope!=SfnnUpdateScopeArg::All {
+                return Err("SFNN BN currently requires sfnn_qat_l1=false, sfnn_l1_effective_weight_clip=false, saturation penalties=0 and update-scope=all; these options are not silently disabled".into());
+            }
+            if self.lr_schedule==LrScheduleKind::Plateau {
+                return Err("BN currently supports standalone non-plateau training/grid_search".into());
+            }
+            if self.sfnn_freeze_l1 || self.sfnn_l1_lr_mult!=1.0 {
+                return Err("BN currently requires sfnn_freeze_l1=false and sfnn_l1_lr_mult=1".into());
+            }
+            if !self.sfnn_bn_gamma.is_finite() || !self.sfnn_bn_beta.is_finite()
+                || !self.sfnn_bn_epsilon.is_finite() || self.sfnn_bn_epsilon<=0.0
+                || !self.sfnn_bn_momentum.is_finite() || self.sfnn_bn_momentum<=0.0 || self.sfnn_bn_momentum>1.0 {
+                return Err("BN requires finite gamma/beta, epsilon>0 and 0<momentum<=1".into());
             }
         }
         if self.warmup_sb > 0 {
@@ -8049,6 +8090,9 @@ fn sfnn_state_forward_outputs(
     positions: &[bulletou_lib::shogi::PackedSfenValue],
 ) -> Result<Vec<f32>, String> {
     let state = load_cuda_cpp_sfnn_initial_state(&args.state_bin, train_args, feature_kind)?;
+    if state.weights.batch_norm.0.iter().any(Option::is_some) {
+        return Err("compare-sfnn-quantization does not yet support BN state.bin; use training validation/qvalid instead".into());
+    }
     let progress_params = cuda_cpp_sfnn_progress_params_for_state(state.progress.as_ref())?;
     let ctx = bulletou_cuda_cpp::Context::new(args.cuda_cpp_device).map_err(|e| e.to_string())?;
     let device_weights = bulletou_cuda_cpp::SfnnForwardDeviceWeights::from_host(&ctx, state.weights.as_host())
@@ -8429,6 +8473,7 @@ fn sfnn_initial_weights_into_readback(
     weights: CudaCppSfnnInitialWeights,
 ) -> bulletou_cuda_cpp::SfnnTrainWeightsReadback {
     bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+        batch_norm: weights.batch_norm,
         l0w: weights.l0w,
         l0b: weights.l0b,
         l1w: weights.l1w,
@@ -8463,6 +8508,9 @@ fn run_average_sfnn_state(args: &AverageSfnnStateArgs) -> Result<AverageSfnnStat
     let mut averaged_progress: Option<Vec<f32>> = None;
     for path in &args.state_bins {
         let state = load_cuda_cpp_sfnn_initial_state(path, &train_args, feature_kind)?;
+        if state.weights.batch_norm.0.iter().any(Option::is_some) {
+            return Err("average-sfnn-state does not support BN checkpoints; averaging raw weights without their running statistics is not valid".into());
+        }
         if wants_progress {
             let progress = state.progress.as_ref().ok_or_else(|| {
                 format!(
@@ -9044,7 +9092,7 @@ impl CudaCppSfnnQuantizedValidationCache {
     ) -> Result<TestMetrics, String> {
         match self {
             Self::Proxy { inner, device_weights } => {
-                if shape.has_compact_l1() {
+                if shape.has_compact_l1() || runner.batch_norm.is_some() {
                     let weights = runner.read_weights(ctx).map_err(|e| e.to_string())?;
                     let proxy_weights = cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
                         args,
@@ -9197,11 +9245,22 @@ fn cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<CudaCppSfnnInitialWeights, String> {
+    let folded=fold_bn_for_inference(weights,shape,if effective_sfnn_factorizer_spec(args).shared {effective_sfnn_factorizer_alpha(args).shared}else{0.0})?;
+    let weights=folded.as_ref();
     if cuda_cpp_sfnn_quantized_proxy_retains_factorizer(args, shape) {
         return cuda_cpp_sfnn_factorized_quantized_proxy_weights_from_readback(args, feature_kind, shape, weights);
     }
     let quantized = quantized_sfnn_weights_from_cuda_cpp_readback(args, feature_kind, shape, weights, progress_params)?;
     cuda_cpp_sfnn_dequantize_proxy_weights(&quantized)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn fold_bn_for_inference<'a>(weights:&'a bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+    shape:bulletou_cuda_cpp::SfnnForwardShape,shared_alpha:f32)
+    ->Result<std::borrow::Cow<'a,bulletou_cuda_cpp::SfnnTrainWeightsReadback>,String> {
+    if weights.batch_norm.0.iter().all(Option::is_none) {return Ok(std::borrow::Cow::Borrowed(weights));}
+    let mut folded=weights.clone();folded.fold_batch_norm(shape,shared_alpha).map_err(|e|e.to_string())?;
+    Ok(std::borrow::Cow::Owned(folded))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -9279,6 +9338,7 @@ fn cuda_cpp_sfnn_factorized_quantized_proxy_weights_from_readback(
     let qb = f32::from(SFNN_QB);
     let fc_bias_scale = qa * qb;
     let proxy = CudaCppSfnnInitialWeights {
+        batch_norm: Default::default(),
         shape: proxy_shape,
         l0w: sfnn_quantize_dequant_i16(l0w_for_proxy, qa),
         l0b: sfnn_quantize_dequant_i16(&weights.l0b, qa),
@@ -9406,6 +9466,7 @@ fn cuda_cpp_sfnn_dequantize_proxy_weights(weights: &QuantizedSfnnWeights) -> Res
     }
 
     let proxy = CudaCppSfnnInitialWeights {
+        batch_norm: Default::default(),
         shape,
         l0w,
         l0b,
@@ -9440,6 +9501,8 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<QuantizedSfnnWeights, String> {
+    let folded=fold_bn_for_inference(weights,shape,if effective_sfnn_factorizer_spec(args).shared {effective_sfnn_factorizer_alpha(args).shared}else{0.0})?;
+    let weights=folded.as_ref();
     let feature_set = feature_kind.feature_set();
     let base_input_size = feature_kind.base_input_size();
     let virtual_rows = feature_kind.virtual_rows();
@@ -10451,6 +10514,9 @@ struct WorkerSfnnSession {
 #[cfg(feature = "cuda-cpp-backend")]
 impl WorkerSfnnSession {
     fn open(args: Args) -> Result<Self, String> {
+        if args.sfnn_bn_ft || args.sfnn_bn_l1 || args.sfnn_bn_l2 {
+            return Err("BN currently supports standalone training/grid_search, not worker mode".into());
+        }
         if args.epoch_settings_json.is_some() {
             return Err("epoch schedules are supported by standalone SFNN training/grid_search, not worker mode".into());
         }
@@ -10490,6 +10556,9 @@ impl WorkerSfnnSession {
         let progress_state = initial_state.progress.clone();
         let progress_params = cuda_cpp_sfnn_progress_params_for_state(progress_state.as_ref())?;
         let initial_weights = &initial_state.weights;
+        if initial_weights.batch_norm.0.iter().any(Option::is_some) {
+            return Err("worker mode cannot load a BN checkpoint; use standalone training/grid_search with matching BN flags".into());
+        }
         let shape = initial_weights.shape;
         print_ft_factorizer_status(feature_kind.base_input_size(), shape.input_size, args.ft_factorizer_alpha);
         let ctx = bulletou_cuda_cpp::Context::new(device).map_err(|e| e.to_string())?;
@@ -17627,6 +17696,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     if let Some(confidences) = sfnn_factorizer_axis_confidences.as_ref() {
         runner.set_factorizer_axis_confidences(&ctx, Some(confidences.as_slice())).map_err(|e| e.to_string())?;
     }
+    runner.configure_batch_norm(&ctx,[args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2],
+        bulletou_cuda_cpp::batch_norm::Config {epsilon:args.sfnn_bn_epsilon,momentum:args.sfnn_bn_momentum,
+            initial_gamma:args.sfnn_bn_gamma,initial_beta:args.sfnn_bn_beta},&initial_weights.batch_norm).map_err(|e|e.to_string())?;
+    if runner.batch_norm.is_some() {
+        print_startup_kv("BatchNorm",format!("FT={} L1={} L2={} gamma={} beta={} momentum={} epsilon={}; FT views shared; dense bucket-wise; inference running-stat fold",
+            args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2,args.sfnn_bn_gamma,args.sfnn_bn_beta,args.sfnn_bn_momentum,args.sfnn_bn_epsilon));
+    }
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
@@ -20739,6 +20815,7 @@ fn build_sfnn_validation_fast_batch(
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug, Clone, PartialEq)]
 struct CudaCppSfnnInitialWeights {
+    batch_norm: bulletou_cuda_cpp::batch_norm::NetworkState,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     l0w: Vec<f32>,
     l0b: Vec<f32>,
@@ -21211,6 +21288,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let (l2axw, l2axb, l3axw, l3axb) = (None, None, None, None);
 
     let weights = CudaCppSfnnInitialWeights {
+        batch_norm: Default::default(),
         shape,
         l0w,
         l0b,
@@ -22553,6 +22631,10 @@ fn load_cuda_cpp_sfnn_weights_from_records(
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     records: &BTreeMap<String, Vec<f32>>,
 ) -> Result<(CudaCppSfnnInitialWeights, bool), String> {
+    let mut batch_norm=bulletou_cuda_cpp::batch_norm::NetworkState::default();
+    for (i,key) in ["bn_ft","bn_l1","bn_l2"].into_iter().enumerate() {
+        if let Some(v)=records.get(key) {batch_norm.0[i]=Some(bulletou_cuda_cpp::batch_norm::State::decode(v).map_err(|e|e.to_string())?);}
+    }
     let base_input_size = feature_kind.base_input_size();
     let factorized_input_size = feature_kind.training_input_size();
     if shape.input_size != factorized_input_size && shape.input_size != base_input_size {
@@ -22611,6 +22693,7 @@ fn load_cuda_cpp_sfnn_weights_from_records(
         extend_cuda_cpp_sfnn_axis_pair_for_progress_tail(shape, &mut l3axw, &mut l3axb, shape.l2_size, 1, "l3ax")?;
 
     let weights = CudaCppSfnnInitialWeights {
+        batch_norm,
         shape,
         l0w,
         l0b: load_cuda_cpp_weight_record(records, "l0b")?,
@@ -23554,6 +23637,8 @@ fn write_cuda_cpp_sfnn_weights_bin(
     optimizer_steps: usize,
     shared_coefficients: [f32; 2],
 ) -> Result<(), String> {
+    let bn_records=weights.batch_norm.0.iter().map(|s|s.as_ref().map(|s|s.encode()).transpose())
+        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     let completed_steps_record = [completed_steps as f32];
     let optimizer_steps_record = [optimizer_steps as f32];
     let mut records: Vec<(&str, &[f32])> = vec![
@@ -23568,6 +23653,9 @@ fn write_cuda_cpp_sfnn_weights_bin(
         ("nnue/weights/l3w", weights.l3w.as_slice()),
         ("nnue/weights/l3b", weights.l3b.as_slice()),
     ];
+    for (i,key) in ["nnue/weights/bn_ft","nnue/weights/bn_l1","nnue/weights/bn_l2"].into_iter().enumerate() {
+        if let Some(v)=&bn_records[i] {records.push((key,v.as_slice()));}
+    }
     if let Some(progress_state) = progress_state {
         records.push(("nnue/weights/progress", progress_state.params.as_slice()));
     }
@@ -23783,6 +23871,8 @@ fn write_cuda_cpp_sfnn_nn_bin_format(
     nn16_weight_scale: Option<u32>,
 ) -> Result<(), String> {
     use std::io::Write as _;
+    let folded=fold_bn_for_inference(weights,shape,if factorizer.shared {factorizer_alpha.shared}else{0.0})?;
+    let weights=folded.as_ref();
 
     let feature_set = feature_kind.feature_set();
     let base_input_size = feature_kind.base_input_size();
@@ -25393,6 +25483,10 @@ fn resume_signature_values(args: &Args) -> String {
     ]
     .join("\n")
         + "\n"
+        + &if args.sfnn_bn_ft || args.sfnn_bn_l1 || args.sfnn_bn_l2 {
+            format!("sfnn_bn={},{},{};gamma={};beta={};momentum={};epsilon={}\n",
+                args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2,args.sfnn_bn_gamma,args.sfnn_bn_beta,args.sfnn_bn_momentum,args.sfnn_bn_epsilon)
+        } else {String::new()}
 }
 
 fn write_resume_config(output_dir: &std::path::Path, args: &Args) -> std::io::Result<()> {
@@ -32188,6 +32282,7 @@ mod tests {
         assert_eq!(cuda_cpp_sfnn_dense_l1w_len_for_shape(shape).unwrap(), 32);
 
         let weights = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+            batch_norm: Default::default(),
             l0w: vec![0.0; shape.input_size * shape.ft_size],
             l0b: vec![0.0; shape.ft_size],
             l1w: vec![0.0; cuda_cpp_sfnn_l1w_len_for_shape(shape).unwrap()],
@@ -32430,6 +32525,7 @@ mod tests {
         }
 
         let weights = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+            batch_norm: Default::default(),
             l0w: vec![10.0],
             l0b: vec![11.0],
             l1w: vec![12.0],
@@ -32549,6 +32645,7 @@ mod tests {
             factorizer_hand_progress_pair: false,
         };
         let weights = CudaCppSfnnInitialWeights {
+            batch_norm: Default::default(),
             shape,
             l0w: vec![0.0; shape.input_size * shape.ft_size],
             l0b: vec![0.0; shape.ft_size],
@@ -32980,6 +33077,7 @@ mod tests {
         let l1_out = shape.l1_out();
         let l2_in = shape.l2_in();
         let weights = CudaCppSfnnInitialWeights {
+            batch_norm: Default::default(),
             shape,
             l0w: seq(shape.input_size * shape.ft_size, 0.0),
             l0b: seq(shape.ft_size, 0.1),
@@ -33144,6 +33242,7 @@ mod tests {
         };
 
         let mut expected_weights = CudaCppSfnnInitialWeights {
+            batch_norm: Default::default(),
             shape,
             l0w: optimizer.l0w.momentum.clone(),
             l0b: optimizer.l0b.momentum.clone(),
@@ -33227,6 +33326,7 @@ mod tests {
         let l1_out = shape.l1_out();
         let l2_in = shape.l2_in();
         let original = CudaCppSfnnInitialWeights {
+            batch_norm: Default::default(),
             shape,
             l0w: seq(shape.input_size * shape.ft_size, 0.0),
             l0b: seq(shape.ft_size, 0.1),
@@ -34211,6 +34311,26 @@ mod tests {
         assert!(!args_at_epoch(&scheduled,1).unwrap().sfnn_l2_l3_center);
         assert!(args_at_epoch(&scheduled,2).unwrap().sfnn_l2_l3_center);
         assert!(!args_at_epoch(&scheduled,3).unwrap().sfnn_l2_l3_center);
+    }
+
+    #[test]
+    fn bn_cli_json_defaults_and_constraints() {
+        let mut argv:Vec<std::ffi::OsString>=["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_halfka2_1024_8_64_progress8","--sfnn-factorizer","shared",
+            "--superbatches","1","--max-epochs","1"].map(Into::into).to_vec();
+        let base=Args::try_parse_from(argv.clone()).unwrap();
+        assert!(!base.sfnn_bn_ft && !base.sfnn_bn_l1 && !base.sfnn_bn_l2);
+        for name in ["sfnn_bn_ft","sfnn_bn_l1","sfnn_bn_l2"] {
+            bulletou_settings_json_value_to_args(Path::new("settings.json"),name,&serde_json::json!(true),&mut argv).unwrap();
+        }
+        let bn=Args::try_parse_from(argv).unwrap();assert!(bn.validate_arch_flags().is_ok());
+        assert!(bn.sfnn_bn_ft && bn.sfnn_bn_l1 && bn.sfnn_bn_l2);
+        assert_eq!(bn.sfnn_bn_gamma,0.25);assert_eq!(bn.sfnn_bn_beta,0.5);
+        assert!(!resume_signature(&base).contains("sfnn_bn="));
+        assert!(resume_signature(&bn).contains("sfnn_bn=true,true,true"));
+        let mut invalid=bn.clone();invalid.sfnn_qat_l1=true;assert!(invalid.validate_arch_flags().unwrap_err().contains("sfnn_qat_l1"));
+        invalid=bn.clone();invalid.sfnn_bn_epsilon=0.0;assert!(invalid.validate_arch_flags().is_err());
+        invalid=bn.clone();invalid.sfnn_bn_momentum=1.1;assert!(invalid.validate_arch_flags().is_err());
     }
 
     #[test]

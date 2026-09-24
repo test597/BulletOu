@@ -87,7 +87,16 @@ struct FtSaturationConfig {
     int patience = 1;
 };
 
+struct BnConfig {
+    float *params=nullptr,*running=nullptr,*stats=nullptr,*grads=nullptr;
+    float *xa=nullptr,*xb=nullptr;
+    size_t width=0,groups=0;
+    float epsilon=1e-5f,momentum=0.1f;
+    bool training=false;
+};
+
 struct BulletOuCudaCppContext {
+    BnConfig bn[3];
     FtSaturationConfig ft_guard;
     float* norm_loss_scratch = nullptr;
     int device = 0;
@@ -1062,7 +1071,7 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size, float ft_factorizer_alpha) {
+    size_t ft_size, float ft_factorizer_alpha, bool bn_raw=false) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
@@ -1111,10 +1120,10 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
         }
     }
 
-    float stm0 = crelu(stm_sum0);
-    float stm1 = crelu(stm_sum1);
-    float nstm0 = crelu(nstm_sum0);
-    float nstm1 = crelu(nstm_sum1);
+    float stm0 = bn_raw ? stm_sum0 : crelu(stm_sum0);
+    float stm1 = bn_raw ? stm_sum1 : crelu(stm_sum1);
+    float nstm0 = bn_raw ? nstm_sum0 : crelu(nstm_sum0);
+    float nstm1 = bn_raw ? nstm_sum1 : crelu(nstm_sum1);
     stm_l0[l0_base + row0] = stm0;
     stm_l0[l0_base + row1] = stm1;
     nstm_l0[l0_base + row0] = nstm0;
@@ -1897,7 +1906,7 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
     float progress_axis_alpha,
     float pair_alpha,
     const float* residual_count_gates,
-    const float* factorizer_axis_confidences) {
+    const float* factorizer_axis_confidences, bool bn_raw=false) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
     if (tid >= total) {
@@ -1969,7 +1978,7 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
         }
         sum += input[input_base + in_col] * weight;
     }
-    output[tid] = crelu(sum);
+    output[tid] = bn_raw ? sum : crelu(sum);
 }
 
 __global__ void sfnn_stacked_l3_output_kernel(
@@ -3078,7 +3087,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
     const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     int compute_parameter_gradients,
-    int accumulate_factorizer_gradients) {
+    int accumulate_factorizer_gradients, bool bn_pregradient=false) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * input_dim * output_dim;
@@ -3126,7 +3135,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
             }
             for (size_t out_col = 0; out_col < output_dim; ++out_col) {
                 size_t out_idx = sample * output_dim + out_col;
-                float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
+                float grad = (bn_pregradient ? output_gradients[out_idx] : crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]));
                 if (grad != 0.0f) {
                     float weight = residual_gate * weights[stack_base + out_col * input_dim + in_col];
                     if (has_shared != 0) {
@@ -3187,7 +3196,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
             axis_alphas);
             }
             size_t out_idx = sample * output_dim + out_col;
-            float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
+            float grad = (bn_pregradient ? output_gradients[out_idx] : crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]));
             float input_value = inputs[sample * input_dim + in_col];
             if (grad != 0.0f && input_value != 0.0f) {
                 size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
@@ -3215,7 +3224,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
             size_t stack = static_cast<size_t>(stack_i32);
             size_t out_idx = sample * output_dim + out_col;
-            float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
+            float grad = (bn_pregradient ? output_gradients[out_idx] : crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]));
             if (grad != 0.0f) {
                 atomicAdd(&bias_gradients[stack * output_dim + out_col], grad);
                 if (accumulate_factorizer_gradients != 0 && has_shared != 0) {
@@ -3877,7 +3886,7 @@ __global__ void sfnn_pairwise_l0_pregrad_kernel(
     float* nstm_pre_gradients,
     float* l0b_gradients,
     size_t batch,
-    size_t ft_size, FtSaturationConfig guard) {
+    size_t ft_size, FtSaturationConfig guard, bool bn_no_bias=false) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
@@ -3918,10 +3927,10 @@ __global__ void sfnn_pairwise_l0_pregrad_kernel(
 
     float bias_grad0 = stm_grad0 + nstm_grad0;
     float bias_grad1 = stm_grad1 + nstm_grad1;
-    if (bias_grad0 != 0.0f) {
+    if (!bn_no_bias && bias_grad0 != 0.0f) {
         atomicAdd(&l0b_gradients[row0], bias_grad0);
     }
-    if (bias_grad1 != 0.0f) {
+    if (!bn_no_bias && bias_grad1 != 0.0f) {
         atomicAdd(&l0b_gradients[row1], bias_grad1);
     }
 }
@@ -5052,6 +5061,8 @@ int launch_nnue_forward_kernels(
     return 0;
 }
 
+#include "batch_norm.cuh"
+
 int launch_sfnn_forward_kernels(
     BulletOuCudaCppContext* ctx,
     size_t input_size,
@@ -5178,11 +5189,16 @@ int launch_sfnn_forward_kernels(
         batch,
         max_active,
         effective_input_size,
-        ft_size, ft_factorizer_alpha);
+        ft_size, ft_factorizer_alpha, ctx->bn[0].params != nullptr);
     if (check_kernel_launch("sfnn_sparse_l0_pairwise_concat_kernel launch") != 0) {
         return -1;
     }
 
+    if(ctx->bn[0].params) {
+        if(bn_forward_bound(ctx,0,stm_l0,nstm_l0,nullptr,batch,ft_size)) return -1;
+        bn_ft_activate<<<static_cast<unsigned>((batch*pairwise+255)/256),256,0,ctx->stream>>>(stm_l0,nstm_l0,combined,batch,ft_size);
+        if(check_kernel_launch("BN FT activation"))return -1;
+    }
     if (common_shard_l1) {
         const size_t group_output = l1_out / l1_group_count;
         if (block_count_1d(batch * l1_out, threads, &blocks, "sfnn_common_shard_l1_kernel") != 0) {
@@ -5271,6 +5287,7 @@ int launch_sfnn_forward_kernels(
         }
     }
 
+    if(bn_forward_bound(ctx,1,l1,nullptr,buckets,batch,l1_out)) return -1;
     if (block_count_1d(batch * l2_in, threads, &blocks, "sfnn_l2_input_kernel") != 0) {
         return -1;
     }
@@ -5312,11 +5329,16 @@ int launch_sfnn_forward_kernels(
             factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
             residual_count_gates,
-            factorizer_axis_confidences);
+            factorizer_axis_confidences, ctx->bn[2].params != nullptr);
     if (check_kernel_launch("sfnn_stacked_l2_crelu_kernel launch") != 0) {
         return -1;
     }
 
+    if(ctx->bn[2].params) {
+        if(bn_forward_bound(ctx,2,l2,nullptr,buckets,batch,l2_size))return -1;
+        bn_activate<<<static_cast<unsigned>((batch*l2_size+255)/256),256,0,ctx->stream>>>(l2,batch*l2_size);
+        if(check_kernel_launch("BN L2 activation"))return -1;
+    }
     if (block_count_1d(batch, threads, &blocks, "sfnn_stacked_l3_output_kernel") != 0) {
         return -1;
     }
@@ -6046,11 +6068,16 @@ int launch_sfnn_inverse_index_l0_backward(
         nstm_l0_pre_gradients,
         l0b_gradients,
         batch,
-        ft_size, ctx->ft_guard);
+        ft_size, ctx->ft_guard, ctx->bn[0].params != nullptr);
     if (check_kernel_launch("sfnn_pairwise_l0_pregrad_kernel launch") != 0) {
         return -1;
     }
 
+    if(ctx->bn[0].params) {
+        if(bn_backward_bound(ctx,0,stm_l0_pre_gradients,nstm_l0_pre_gradients,nullptr,batch,ft_size))return -1;
+        bn_bias_sum<<<static_cast<unsigned>((ft_size+255)/256),256,0,ctx->stream>>>(stm_l0_pre_gradients,nstm_l0_pre_gradients,l0b_gradients,batch,ft_size);
+        if(check_kernel_launch("BN FT bias backward"))return -1;
+    }
     size_t n_features = input_size;
     const bool halfka2_factorized = input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE;
     if (halfka2_factorized) {
@@ -6396,6 +6423,13 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
+    if(ctx->bn[2].params) {
+        // Apply clamp derivative once, then full BN derivative. Downstream
+        // affine backward must not apply the clamp derivative a second time.
+        dense_crelu_pre_gradient_kernel<<<static_cast<unsigned>((batch*l2_size+255)/256),256,0,ctx->stream>>>(l2,l2_gradients,batch,l2_size);
+        if(check_kernel_launch("BN L2 clamp backward"))return -1;
+        if(bn_backward_bound(ctx,2,l2_gradients,nullptr,buckets,batch,l2_size))return -1;
+    }
     size_t l2_threads = dense_param_reduce_fast_path
         ? batch * l2_in
         : std::max(batch * l2_in, batch * l2_in * l2_size);
@@ -6442,7 +6476,7 @@ int launch_sfnn_backward_kernels(
         residual_count_gates,
         factorizer_axis_confidences,
         dense_param_reduce_fast_path ? 0 : 1,
-        0);
+        0, ctx->bn[2].params != nullptr);
     if (check_kernel_launch("sfnn_stacked_crelu_backward_kernel launch") != 0) {
         return -1;
     }
@@ -6513,7 +6547,7 @@ int launch_sfnn_backward_kernels(
                 factorizer_progress_axis_alpha,
                 factorizer_pair_alpha,
                 factorizer_axis_confidences,
-                1,
+                ctx->bn[2].params ? 0 : 1,
                 "sfnn dense reduce L2 params") != 0) {
             return -1;
         }
@@ -6530,6 +6564,7 @@ int launch_sfnn_backward_kernels(
     if (check_kernel_launch("sfnn_l2_input_backward_kernel launch") != 0) {
         return -1;
     }
+    if(bn_backward_bound(ctx,1,l1_gradients,nullptr,buckets,batch,l1_out))return -1;
     if (const char* raw = std::getenv("BULLETOU_EXPERIMENT_L1_MEAN_PENALTY")) {
         char* end = nullptr;
         float strength = std::strtof(raw, &end);
@@ -6796,7 +6831,7 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
-    if (fuse_pairwise_l0 != 0 || ctx->ft_guard.weights != nullptr) {
+    if (fuse_pairwise_l0 != 0 || ctx->ft_guard.weights != nullptr || ctx->bn[0].params != nullptr) {
         if (launch_sfnn_inverse_index_l0_backward(
                 ctx,
                 stm_indices,
