@@ -63,7 +63,9 @@ Supported: cuda-cpp standalone training/grid search, dense SFNN, none/shared
 factorizers, gradient accumulation, and optional existing centering.
 Not supported yet: worker, plateau, compact/grouped L1, count gates, layer
 freezing/individual LR multipliers, QAT, L1 effective weight clipping, or FT/weight
-saturation penalties. Unsupported combinations fail explicitly, not silently.
+saturation penalties. If QAT is requested with BN, a yellow WARNING is printed
+and training continues with QAT disabled (effective `sfnn_qat_l1=false`), leaving
+BN enabled and settings files unchanged. Other unsupported combinations still fail.
 Each BN layer is limited to 65536 bucket/unit channels; FT has one group.
 Validation batches must not exceed the training batch size.
 `average-sfnn-state` and `compare-sfnn-quantization` reject BN state.bin files

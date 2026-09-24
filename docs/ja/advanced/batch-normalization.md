@@ -59,7 +59,8 @@ BNなしのcheckpointに新たにBNを追加すると、forwardが変わりま�
 
 - cuda-cppの通常学習と`grid_search.py`。dense SFNN、factorizer `none` / `shared`。
 - 現時点ではworker、plateau、compact/grouped L1、bucket-count gates、層のfreeze／個別LR倍率は未対応。
-- QAT、`sfnn_l1_effective_weight_clip`、FT/weight saturation penaltyは併用不可。暗黙に無効化せずエラーで知らせます。
+- QATが同時指定された場合、黄色のWARNINGを出し、QATだけを無効化して続行します（実効値 `sfnn_qat_l1=false`）。BNは有効のままです。設定ファイルは書き換えません。
+- `sfnn_l1_effective_weight_clip`、FT/weight saturation penaltyは併用不可で、引き続きエラーにします。
 - L1／L2・L3の中心化とは併用できます（中心化側の制約も適用）。
 - 各BN層は `bucket数 × unit数 <= 65536`。FTは1group。
 - validationのbatch sizeは学習batch size以下にしてください。

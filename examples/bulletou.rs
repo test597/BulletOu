@@ -5286,6 +5286,9 @@ struct Args {
 }
 
 impl Args {
+    fn effective_sfnn_qat_l1(&self) -> bool {
+        self.sfnn_qat_l1 && !(self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2)
+    }
     /// Resolve the checkpoint output directory.
     ///
     /// - `--output PATH` honours the user's choice as-is.
@@ -5407,9 +5410,15 @@ impl Args {
                 || (spec!=SfnnFactorizerSpec::NONE && spec!=SfnnFactorizerSpec::SHARED) || self.sfnn_bucket_counts.is_some() {
                 return Err("SFNN BN requires cuda-cpp, dense SFNN, factorizer none/shared and no bucket counts".into());
             }
-            if self.sfnn_qat_l1 || self.sfnn_l1_effective_weight_clip || self.sfnn_ft_saturation_penalty!=0.0
+            if self.sfnn_qat_l1 {
+                static WARNING: std::sync::Once = std::sync::Once::new();
+                WARNING.call_once(|| eprintln!("{}", paint(
+                    "  WARNING: BN and L1 QAT cannot currently be combined; continuing with effective sfnn_qat_l1=false (requested=true). BN remains enabled.",
+                    ConsoleColor::BoldYellow)));
+            }
+            if self.sfnn_l1_effective_weight_clip || self.sfnn_ft_saturation_penalty!=0.0
                 || self.sfnn_saturation_penalty!=0.0 || self.sfnn_update_scope!=SfnnUpdateScopeArg::All {
-                return Err("SFNN BN currently requires sfnn_qat_l1=false, sfnn_l1_effective_weight_clip=false, saturation penalties=0 and update-scope=all; these options are not silently disabled".into());
+                return Err("SFNN BN currently requires sfnn_l1_effective_weight_clip=false, saturation penalties=0 and update-scope=all; these options are not silently disabled".into());
             }
             if self.lr_schedule==LrScheduleKind::Plateau {
                 return Err("BN currently supports standalone non-plateau training/grid_search".into());
@@ -5430,7 +5439,7 @@ impl Args {
                 return Err("--warmup-sb requires cuda-cpp production training with step/geometric/cos LR".into());
             }
         }
-        if self.sfnn_qat_l1 {
+        if self.effective_sfnn_qat_l1() {
             if !self.eval_type().uses_layerstack() {
                 return Err("--sfnn-qat-l1 requires an SFNN arch".to_string());
             }
@@ -24733,7 +24742,7 @@ fn print_sfnn_qat_mode(args: &Args) {
     } else { "off" });
     print_startup_kv(
         "L1 QAT",
-        if args.sfnn_qat_l1 {
+        if args.effective_sfnn_qat_l1() {
             "on: folded weight round(64*w)/64, bias round(8128*b)/8128; identity STE; FT/L2/L3 unchanged"
         } else {
             "off"
@@ -24760,7 +24769,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
         saturation_penalty: args.sfnn_saturation_penalty,
         saturation_threshold: args.sfnn_saturation_threshold,
         tatara_weight_clip: uses_tatara_weight_clip(args),
-        qat_l1: args.sfnn_qat_l1,
+        qat_l1: args.effective_sfnn_qat_l1(),
         ..Default::default()
     };
     if args.sfnn_freeze_l1 {
@@ -25465,7 +25474,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),
         format!("sfnn_norm_loss_strength={:.9}", args.sfnn_norm_loss_strength),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
-        format!("sfnn_qat_l1={}", args.sfnn_qat_l1),
+        format!("sfnn_qat_l1={}", args.effective_sfnn_qat_l1()),
         format!("sfnn_l2_l3_center={}", args.sfnn_l2_l3_center),
         format!("sfnn_l1_center={}", args.sfnn_l1_center),
         format!("sfnn_l1_effective_weight_clip={}", args.sfnn_l1_effective_weight_clip),
@@ -34328,7 +34337,13 @@ mod tests {
         assert_eq!(bn.sfnn_bn_gamma,0.25);assert_eq!(bn.sfnn_bn_beta,0.5);
         assert!(!resume_signature(&base).contains("sfnn_bn="));
         assert!(resume_signature(&bn).contains("sfnn_bn=true,true,true"));
-        let mut invalid=bn.clone();invalid.sfnn_qat_l1=true;assert!(invalid.validate_arch_flags().unwrap_err().contains("sfnn_qat_l1"));
+        let mut invalid=bn.clone();invalid.sfnn_qat_l1=true;
+        assert!(invalid.validate_arch_flags().is_ok());
+        assert!(!invalid.effective_sfnn_qat_l1());
+        assert!(!cuda_cpp_sfnn_layer_lr_multipliers(&invalid,None).qat_l1);
+        assert_eq!(resume_signature(&invalid),resume_signature(&bn));
+        let mut qat=base.clone();qat.sfnn_qat_l1=true;
+        assert!(qat.effective_sfnn_qat_l1());
         invalid=bn.clone();invalid.sfnn_bn_epsilon=0.0;assert!(invalid.validate_arch_flags().is_err());
         invalid=bn.clone();invalid.sfnn_bn_momentum=1.1;assert!(invalid.validate_arch_flags().is_err());
     }
